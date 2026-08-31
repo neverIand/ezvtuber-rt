@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 import os
 from ezvtb_rt.tha3_ort import THA3ORTSessions, THA3ORTNonDefaultSessions
-from ezvtb_rt.cache import Cacher
+from ezvtb_rt.cache import Cacher, array_cache_key
 from ezvtb_rt.tha4_ort import THA4ORTSessions, THA4ORTNonDefaultSessions
 from ezvtb_rt.tha4_student_ort import THA4StudentORTSessions
 import ezvtb_rt
@@ -144,11 +144,12 @@ class CoreORT:
             if self.tha_model_fp16 and not self.v3:  # For THA4 with FP16 model poses are fp16 inputs
                 poses[i] = poses[i].astype(np.float16)
 
-        tha_result: np.ndarray = self.cacher.get(hash(str(poses[-1]))) if self.cacher is not None else None
+        tha_pose_key = array_cache_key(poses[-1]) if self.cacher is not None else None
+        tha_result: np.ndarray = self.cacher.get(tha_pose_key) if self.cacher is not None else None
         if tha_result is None:  # Do not use cacher or cache missed
             tha_result = self.tha.inference(poses[-1])
             if self.cacher is not None:
-                self.cacher.put(hash(str(poses[-1])), tha_result)
+                self.cacher.put(tha_pose_key, tha_result)
 
         if self.rife is None and self.sr is None and self.sr_a4k is None:  # Only THA
             return np.expand_dims(tha_result, axis=0)
@@ -160,7 +161,7 @@ class CoreORT:
                                                    'tha_img_1': np.expand_dims(tha_result, axis=0)})[0]
             else:  # Multiple poses provided
                 if self.cacher:
-                    cached_rife = [self.cacher.get(hash(str(p))) for p in poses[:-1]]
+                    cached_rife = [self.cacher.get(array_cache_key(p)) for p in poses[:-1]]
                 else:
                     cached_rife = [None] * (len(poses) - 1)
                 if all(x is None for x in cached_rife):  # No cached frames
@@ -222,7 +223,7 @@ class CoreORT:
                     raise ValueError('RIFE model scale not supported for partial caching')
                 if self.cacher and len(poses) > 1:  # Update cache for newly computed frames
                     for i in range(len(poses) - 1):
-                        self.cacher.put(hash(str(poses[i])), rife_result[i])
+                        self.cacher.put(array_cache_key(poses[i]), rife_result[i])
             self.last_tha_output = tha_result
         else:
             rife_result = np.expand_dims(tha_result, axis=0)
@@ -234,7 +235,7 @@ class CoreORT:
         sr_process_func = self.sr_a4k_process if self.sr_a4k is not None else self.sr_onnx_process
         # SR
         if len(poses) == 1:  # Only one pose provided,
-            hs = hash(str(poses[-1]))
+            hs = array_cache_key(poses[-1])
             cached_sr = self.sr_cacher.get(hs) if self.sr_cacher is not None else None
             sr_batch = rife_result.shape[0]
             if sr_batch > 1:  # Multiple frames
@@ -255,9 +256,9 @@ class CoreORT:
         else:  # Multiple poses provided for multiple frames
             assert len(poses) == rife_result.shape[0]
             all_cached: bool = self.sr_cacher is not None and all(
-                self.sr_cacher.query(hash(str(pose))) for pose in poses)
+                self.sr_cacher.query(array_cache_key(pose)) for pose in poses)
             if all_cached:  # All frames are cached, this is a quick path
-                sr_result = np.stack([self.sr_cacher.get(hash(str(pose))) for pose in poses], axis=0)
+                sr_result = np.stack([self.sr_cacher.get(array_cache_key(pose)) for pose in poses], axis=0)
             else:  # Some frames are not cached
                 if self.sr_cacher is None:  # No cacher, process all frames directly
                     sr_result = sr_process_func(rife_result)
@@ -265,7 +266,7 @@ class CoreORT:
                     sr_result = []
                     to_sr_images = []
                     for i in range(len(poses)):
-                        hs = hash(str(poses[i]))
+                        hs = array_cache_key(poses[i])
                         cached_sr = self.sr_cacher.get(hs)
                         if cached_sr is None:
                             to_sr_images.append(rife_result[i])
@@ -279,7 +280,7 @@ class CoreORT:
                     for i in range(len(poses)):
                         if sr_result[i] is None:
                             sr_result[i] = sr_outputs[sr_idx]
-                            hs = hash(str(poses[i]))
+                            hs = array_cache_key(poses[i])
                             self.sr_cacher.put(hs, sr_outputs[sr_idx])
                             sr_idx += 1
                     sr_result = np.stack(sr_result, axis=0)

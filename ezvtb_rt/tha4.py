@@ -7,6 +7,7 @@ pipeline that reuses the compressed VRAM cacher defined in `vram_cache.py`.
 from ezvtb_rt.trt_utils import *
 from ezvtb_rt.trt_engine import TRTEngine, HostDeviceMem
 from ezvtb_rt.vram_cache import VRAMCacher
+from ezvtb_rt.cache import array_cache_key
 from typing import List, Optional
 
 
@@ -149,9 +150,9 @@ class THA4Engines:
         np.copyto(self.upscaler.inputs[3].host, rotation_pose)
         self.upscaler.inputs[3].htod(stream)
 
-        morpher_hash = hash(str(pose[0, :12 + 27]))
+        morpher_hash = array_cache_key(pose[0, :12 + 27])
         morpher_cached = None if self.cacher is None else self.cacher.get(morpher_hash)
-        combiner_hash = hash(str(pose[0, :12]))
+        combiner_hash = array_cache_key(pose[0, :12])
         combiner_cached = None
         if self.use_eyebrow and self.cacher is not None:
             combiner_cached = self.cacher.get(combiner_hash)

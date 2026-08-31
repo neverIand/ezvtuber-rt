@@ -1,13 +1,24 @@
 import numpy as np
 from collections import OrderedDict
 import brotli
-from typing import Optional
+from typing import Hashable, Optional
 
 """
 Cache system with compression and LRU eviction.
 Handles image data with synchronous compression/decompression.
 Uses HuffYUV for efficient compression/decompression.
 """
+
+
+def array_cache_key(array: np.ndarray) -> Hashable:
+    """Create an exact, collision-safe in-memory key for a NumPy array.
+
+    Returning the original metadata and bytes lets Python's dictionary resolve
+    hash collisions by equality. This also avoids NumPy's comparatively costly
+    and formatting-dependent string conversion.
+    """
+    contiguous = np.ascontiguousarray(array)
+    return contiguous.dtype.str, contiguous.shape, contiguous.tobytes()
 
 
 class Cacher:
@@ -43,7 +54,7 @@ class Cacher:
         self.hits = 0  # Total successful cache retrievals
         self.miss = 0  # Total cache misses
 
-    def query(self, hs:int) -> bool:
+    def query(self, hs: Hashable) -> bool:
         """Check if a hash key exists in the cache.
         
         Args:
@@ -56,7 +67,7 @@ class Cacher:
             self.cache.move_to_end(hs)  # Update LRU position
         return is_in
     
-    def get(self, hs:int) -> Optional[np.ndarray]:
+    def get(self, hs: Hashable) -> Optional[np.ndarray]:
         """Retrieve cached data by hash key without anti-thrashing.
         
         Args:
@@ -74,7 +85,7 @@ class Cacher:
             self.miss += 1
             return None
 
-    def put(self, hs:int, data:np.ndarray):
+    def put(self, hs: Hashable, data:np.ndarray):
         """Write data to cache with compression.
         
         Args:

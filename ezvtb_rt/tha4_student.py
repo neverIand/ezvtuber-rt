@@ -11,6 +11,7 @@ from collections import OrderedDict
 from ezvtb_rt.trt_utils import *
 from ezvtb_rt.trt_engine import HostDeviceMem, TRTEngine
 from ezvtb_rt.vram_cache import VRAMCacher
+from ezvtb_rt.cache import array_cache_key
 
 class THA4StudentEngines():
     """THA4 Student Model (Mode 14) TensorRT implementation
@@ -84,7 +85,7 @@ class THA4StudentEngines():
         self.body_morpher.inputs[2].htod(stream)
         
         # Stage 1: Face Morpher (pose only, generates 128x128 face)
-        face_pose_hash = hash(str(face_pose))
+        face_pose_hash = array_cache_key(face_pose)
         face_cached = None if self.cacher is None else \
             self.cacher.get(face_pose_hash)
         face_cached = face_cached[0] if face_cached is not None else None

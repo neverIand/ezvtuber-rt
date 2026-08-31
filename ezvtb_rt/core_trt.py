@@ -3,7 +3,7 @@ from ezvtb_rt.trt_engine import TRTEngine, HostDeviceMem
 from ezvtb_rt.tha3 import THA3Engines
 from ezvtb_rt.tha4 import THA4Engines
 from ezvtb_rt.tha4_student import THA4StudentEngines
-from ezvtb_rt.cache import Cacher
+from ezvtb_rt.cache import Cacher, array_cache_key
 import ezvtb_rt
 import numpy as np
 import os
@@ -205,6 +205,18 @@ class CoreTRT:
         self.last_tha_output = img
 
     def inference(self, poses: List[np.ndarray]) -> np.ndarray:
+        try:
+            return self._inference(poses)
+        finally:
+            # VRAM cache copies run on a separate stream. In safety-limited
+            # mode, wait here so the caller's duty-cycle timer includes that
+            # work instead of letting it consume the scheduled cooldown.
+            if get_gpu_duty_limit_percent() < 100:
+                cache_stream = getattr(self.tha, 'cachestream', None)
+                if cache_stream is not None:
+                    cache_stream.synchronize()
+
+    def _inference(self, poses: List[np.ndarray]) -> np.ndarray:
         """Run full inference pipeline
         Args:
             poses: One or more facial pose arrays. If multiple are provided,
@@ -228,11 +240,15 @@ class CoreTRT:
         tha_mem_res: HostDeviceMem = self.tha.getOutputMem()
 
         cached_output = None
+        tha_pose_key = None
         # THA cache lookup for the last pose only (matches ORT semantics)
         if self.cacher is not None:
             self.cache_stream.synchronize()
-            cached_output = self.cacher.get(hash(str(tha_pose)))
+            tha_pose_key = array_cache_key(tha_pose)
+            cached_output = self.cacher.get(tha_pose_key)
             if cached_output is not None:
+                if self.rife is None and self.sr is None and self.sr_a4k is None:
+                    return np.expand_dims(cached_output, axis=0)
                 np.copyto(tha_mem_res.host, cached_output)
                 tha_mem_res.htod(self.main_stream)
         # Run THA when not cached
@@ -242,11 +258,11 @@ class CoreTRT:
             tha_mem_res.dtoh(self.main_stream)
             self.main_stream.synchronize()
             if self.cacher is not None:
-                self.cacher.put(hash(str(tha_pose)), tha_mem_res.host)
+                self.cacher.put(tha_pose_key, tha_mem_res.host)
 
         # If no RIFE and no SR, just return THA result
         if self.rife is None and self.sr is None and self.sr_a4k is None:
-            return np.expand_dims(cached_output if cached_output is not None else np.copy(tha_mem_res.host), axis=0)
+            return np.expand_dims(np.copy(tha_mem_res.host), axis=0)
         
         # RIFE interpolation stage
         rife_mem_res : HostDeviceMem = None
@@ -263,7 +279,7 @@ class CoreTRT:
                 self.main_stream.synchronize()
             else:
                 if self.cacher is not None:
-                    cached_rife = [self.cacher.get(hash(str(p))) for p in poses[:-1]]
+                    cached_rife = [self.cacher.get(array_cache_key(p)) for p in poses[:-1]]
                 else:
                     cached_rife = [None] * (len(poses) -1)
                 if all(x is None for x in cached_rife): # No cached frames
@@ -375,7 +391,7 @@ class CoreTRT:
                     self.main_stream.synchronize()
                 if self.cacher is not None:
                     for i in range(1, len(poses) -1):
-                        self.cacher.put(hash(str(poses[i])), rife_mem_res.host[i])
+                        self.cacher.put(array_cache_key(poses[i]), rife_mem_res.host[i])
             # Track last THA output for future interpolation
             self.last_tha_output = np.copy(tha_mem_res.host)
         else:
@@ -397,7 +413,7 @@ class CoreTRT:
         if len(poses) == 1:
             for i in range(to_sr_images.shape[0] - 1):
                 sr_results.append(self.a4k_infer_bgra(to_sr_images[i]))
-            hs = hash(str(poses[0]))
+            hs = array_cache_key(poses[0])
             cached_sr = self.sr_cacher.get(hs) if self.sr_cacher is not None else None
             if cached_sr is not None:
                 sr_results.append(cached_sr)
@@ -408,7 +424,7 @@ class CoreTRT:
         else:
             assert to_sr_images.shape[0] == len(poses)
             for i in range(len(poses)):
-                hs = hash(str(poses[i]))
+                hs = array_cache_key(poses[i])
                 cached_sr = self.sr_cacher.get(hs) if self.sr_cacher is not None else None
                 if cached_sr is not None:
                     sr_results.append(cached_sr)
@@ -434,7 +450,7 @@ class CoreTRT:
     def sr_trt_process(self, poses: List[np.ndarray], rife_mem_res: HostDeviceMem)-> np.ndarray:
         # Special handling when only one pose was provided
         if len(poses) == 1:
-            hs = hash(str(poses[0]))
+            hs = array_cache_key(poses[0])
             cached_sr = None if self.sr_cacher is None else self.sr_cacher.get(hs)
             if cached_sr is not None: # SR cache hit
                 # Run SR on remaining frames only
@@ -470,7 +486,7 @@ class CoreTRT:
             sr_results = [None] * len(poses)
             to_sr_images = []
             for i in range(len(poses)):
-                hs = hash(str(poses[i]))
+                hs = array_cache_key(poses[i])
                 sr_results[i] = None if self.sr_cacher is None else self.sr_cacher.get(hs)
                 if sr_results[i] is None:
                     to_sr_images.append(rife_mem_res.host[i])
@@ -493,7 +509,7 @@ class CoreTRT:
                     if sr_results[i] is None:
                         sr_results[i] = np.copy(self.sr.outputs[0].host[sr_output_idx])
                         if self.sr_cacher is not None:
-                            self.sr_cacher.put(hash(str(poses[i])), sr_results[i])
+                            self.sr_cacher.put(array_cache_key(poses[i]), sr_results[i])
                         sr_output_idx += 1
                 out = np.stack(sr_results, axis=0)
                 _mark_interpolated_frames(out)

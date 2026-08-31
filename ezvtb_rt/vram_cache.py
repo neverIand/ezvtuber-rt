@@ -1,7 +1,7 @@
 from ezvtb_rt.trt_utils import *
 import pycuda.driver as cuda
 from collections import OrderedDict
-from typing import List, Optional
+from typing import Hashable, List, Optional
 from ezvtb_rt.trt_engine import HostDeviceMem
 
 #memory management
@@ -37,7 +37,7 @@ class VRAMCacher:
         self.current_size_bytes = 0
         stream = stream if stream is not None else cuda.Stream()
         self.stream = stream
-        self._cache: OrderedDict[int, List[VRAMMem]] = OrderedDict()
+        self._cache: OrderedDict[Hashable, List[VRAMMem]] = OrderedDict()
         self.hits = 0
         self.miss = 0
     
@@ -53,7 +53,7 @@ class VRAMCacher:
             evicted_size = self._calculate_entry_size(oldest_buffers)
             self.current_size_bytes -= evicted_size
     
-    def put(self, key: int, buffers: List[HostDeviceMem]) -> None:
+    def put(self, key: Hashable, buffers: List[HostDeviceMem]) -> None:
         """
         Store a list of HostDeviceMem buffers in the cache (compressed).
         
@@ -79,7 +79,7 @@ class VRAMCacher:
         self._cache[key] = saved_mems
         self.current_size_bytes += entry_size
     
-    def get(self, key: int) -> Optional[List[VRAMMem]]:
+    def get(self, key: Hashable) -> Optional[List[VRAMMem]]:
         """
         Retrieve and decode a cached entry by key.
         
@@ -101,7 +101,7 @@ class VRAMCacher:
         # Decode all buffers
         return self._cache[key]
     
-    def __contains__(self, key: int) -> bool:
+    def __contains__(self, key: Hashable) -> bool:
         """Check if a key exists in the cache."""
         return key in self._cache
     

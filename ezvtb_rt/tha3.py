@@ -1,6 +1,7 @@
 from ezvtb_rt.trt_utils import *
 from ezvtb_rt.trt_engine import TRTEngine, HostDeviceMem
 from ezvtb_rt.vram_cache import VRAMCacher
+from ezvtb_rt.cache import array_cache_key
 import asyncio
 from typing import Tuple, Optional
 
@@ -170,9 +171,9 @@ class THA3Engines():
         self.editor.inputs[3].htod(stream)
 
         # Compute hashes for cache lookup
-        morpher_hash = hash(str(pose[0, :12+27]))
+        morpher_hash = array_cache_key(pose[0, :12+27])
         morpher_cached = None if self.cacher is None else self.cacher.get(morpher_hash)
-        combiner_hash = hash(str(pose[0, :12]))
+        combiner_hash = array_cache_key(pose[0, :12])
         if self.use_eyebrow:
             combiner_cached = None if self.cacher is None else self.cacher.get(combiner_hash)
         else:
