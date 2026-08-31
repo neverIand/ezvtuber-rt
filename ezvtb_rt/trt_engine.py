@@ -8,7 +8,9 @@ This module handles:
 """
 
 from ezvtb_rt.trt_utils import *
-from os.path import join
+import os
+from pathlib import Path
+import time
 
 #memory management
 class HostDeviceMem(object):
@@ -43,15 +45,56 @@ class HostDeviceMem(object):
 
 class TRTEngine:
     def __init__(self, engine: trt.ICudaEngine | str, n_input:int):
-        if isinstance(engine, str):
-            engine = load_engine(engine)
+        source_path = os.fspath(engine) if isinstance(engine, (str, os.PathLike)) else None
+        if source_path is not None:
+            engine = load_engine(source_path)
             assert engine is not None, f'Failed to load engine from path {engine}'
         self.engine: trt.ICudaEngine = engine
         TRT_LOGGER.log(TRT_LOGGER.INFO, 'Creating inference context')
         # create execution context
-        runtime_config = engine.create_runtime_config()
-        runtime_config.cuda_graph_strategy = trt.CudaGraphStrategy.WHOLE_GRAPH_CAPTURE
-        self.context: trt.IExecutionContext = engine.create_execution_context(runtime_config)
+        self.runtime_config = engine.create_runtime_config()
+        self.runtime_config.cuda_graph_strategy = trt.CudaGraphStrategy.WHOLE_GRAPH_CAPTURE
+        self.runtime_cache = None
+        self.runtime_cache_path = None
+        if source_path is not None:
+            try:
+                self.runtime_cache_path = get_runtime_cache_path(source_path)
+                self.runtime_cache, cache_loaded = load_runtime_cache(
+                    self.runtime_config,
+                    self.runtime_cache_path,
+                )
+                if cache_loaded:
+                    TRT_LOGGER.log(
+                        TRT_LOGGER.INFO,
+                        f'Loaded TensorRT runtime cache: {self.runtime_cache_path}',
+                    )
+            except Exception as error:
+                self.runtime_cache = None
+                TRT_LOGGER.log(
+                    TRT_LOGGER.WARNING,
+                    f'Runtime cache unavailable for {source_path}: {error}',
+                )
+
+        context_started_at = time.perf_counter()
+        try:
+            self.context: trt.IExecutionContext = engine.create_execution_context(
+                self.runtime_config,
+            )
+        finally:
+            source_name = Path(source_path).name if source_path else 'in-memory engine'
+            pace_gpu_startup(
+                context_started_at,
+                f'context creation ({source_name})',
+            )
+        if self.context is None:
+            raise RuntimeError('TensorRT failed to create an inference context')
+
+        # Keep the runtime config/cache alive for the lifetime of the context.
+        # Context creation may already JIT kernels, while the first inference can
+        # add shape-specific kernels, so persist at both points.
+        self._runtime_cache_save_pending = self.runtime_cache is not None
+        self._persist_runtime_cache()
+        self._runtime_cache_save_pending = self.runtime_cache is not None
         self.n_batch: int = -1
         self.in_out_tensors: dict = {}
         self.inputs: List[HostDeviceMem] = []
@@ -80,6 +123,19 @@ class TRTEngine:
             
     def get_last_inference_time(self):
         return self.start_event.time_till(self.end_event)
+
+    def _persist_runtime_cache(self):
+        if self.runtime_cache is None or self.runtime_cache_path is None:
+            return False
+        try:
+            save_runtime_cache(self.runtime_cache, self.runtime_cache_path)
+        except Exception as error:
+            TRT_LOGGER.log(
+                TRT_LOGGER.WARNING,
+                f'Unable to save TensorRT runtime cache {self.runtime_cache_path}: {error}',
+            )
+            return False
+        return True
 
     def putInputs(self, np_inputs: List[np.ndarray | HostDeviceMem], n_batch: int = 1, stream: cuda.Stream = None, sync: bool = False):
         """Non-blocking input upload - doesn't synchronize stream"""
@@ -114,6 +170,9 @@ class TRTEngine:
         self.context.execute_async_v3(stream.handle)
         # Record the end event
         self.end_event.record(stream)
+        if self._runtime_cache_save_pending:
+            self._persist_runtime_cache()
+            self._runtime_cache_save_pending = False
         # Synchronize the stream if requested
         if sync:
             stream.synchronize()
@@ -153,6 +212,7 @@ class TRTEngine:
                 for output_tensor_name, output_mem in zip(self.output_tensor_names, outputs):
                     self.context.set_tensor_address(output_tensor_name, int(output_mem.device))
         else:
+            self._runtime_cache_save_pending = self.runtime_cache is not None
             for input_tensor_name in self.input_tensor_names:
                 shape = self.input_tensors_original_shapes[input_tensor_name].copy()
                 for i in range(len(shape)):

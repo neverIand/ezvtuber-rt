@@ -1,16 +1,23 @@
-from pathlib import Path
 import os
+from pathlib import Path
+import time
 import numpy as np
 import tensorrt_rtx as trt
 from typing import List, Dict, Tuple
 import pycuda.driver as cuda
 from os.path import join
 import numpy
-from tqdm import tqdm
-from ezvtb_rt.init_utils import check_exist_all_models
-import tempfile
+from ezvtb_rt.trt_cache import (
+    atomic_write,
+    engine_build_lock,
+    get_engine_cache_path as _get_engine_cache_path,
+    get_runtime_cache_path as _get_runtime_cache_path,
+    load_runtime_cache,
+    save_runtime_cache,
+)
 
 TRT_LOGGER = trt.Logger(trt.Logger.INFO)
+GPU_DUTY_LIMIT_ENV = "EZVTB_GPU_DUTY_LIMIT"
 
 # Solution from https://github.com/NVIDIA/TensorRT/issues/1050#issuecomment-775019583
 def cudaSetDevice(device_idx):
@@ -21,6 +28,59 @@ def cudaSetDevice(device_idx):
     if ret != 0:
         error_string = libcudart.cudaGetErrorString(ret)
         raise RuntimeError("cudaSetDevice: " + str(error_string))
+
+
+def get_gpu_duty_limit_percent() -> float:
+    """Read the optional startup duty-cycle limit without changing defaults."""
+    try:
+        limit = float(os.environ.get(GPU_DUTY_LIMIT_ENV, "100"))
+    except ValueError:
+        return 100.0
+    if not 0 < limit <= 100:
+        return 100.0
+    return limit
+
+
+def pace_gpu_startup(started_at: float, operation: str) -> float:
+    """Add conservative cooldown after an indivisible TensorRT startup call."""
+    limit = get_gpu_duty_limit_percent()
+    if limit >= 100:
+        return 0.0
+
+    active_seconds = max(0.0, time.perf_counter() - started_at)
+    cooldown_seconds = active_seconds * (100.0 / limit - 1.0)
+    if cooldown_seconds > 0:
+        TRT_LOGGER.log(
+            TRT_LOGGER.INFO,
+            f'GPU safety cooldown after {operation}: {cooldown_seconds:.3f}s '
+            f'(target duty cycle {limit:.1f}%)',
+        )
+        time.sleep(cooldown_seconds)
+    return cooldown_seconds
+
+
+def _trt_cache_identity() -> str:
+    identity = [
+        getattr(trt, '__version__', 'unknown'),
+        f'device-id={os.environ.get("EZVTB_DEVICE_ID", "0")}',
+    ]
+    try:
+        device = cuda.Context.get_device()
+        identity.append(f'name={device.name()}')
+        identity.append(f'cc={device.compute_capability()}')
+    except Exception:
+        # Cache loading can be inspected in CPU-only tests or before a CUDA
+        # context exists. TensorRT deserialization remains the final guard.
+        pass
+    return '|'.join(identity)
+
+
+def get_engine_cache_path(onnx_path: str) -> Path:
+    return _get_engine_cache_path(onnx_path, _trt_cache_identity())
+
+
+def get_runtime_cache_path(source_path: str) -> Path:
+    return _get_runtime_cache_path(source_path, _trt_cache_identity())
 
 def build_engine(onnx_file_path:str) -> bytes:
     builder = trt.Builder(TRT_LOGGER)
@@ -72,35 +132,80 @@ def build_engine(onnx_file_path:str) -> bytes:
         config.builder_optimization_level = 5
     # Build engine.
     TRT_LOGGER.log(TRT_LOGGER.INFO, f'Building an engine from file {onnx_file_path}; this may take a while...')
-    serialized_engine = builder.build_serialized_network(network, config)
+    build_started_at = time.perf_counter()
+    try:
+        serialized_engine = builder.build_serialized_network(network, config)
+    finally:
+        pace_gpu_startup(build_started_at, f'engine build ({Path(onnx_file_path).name})')
+    if serialized_engine is None:
+        raise RuntimeError(f'Failed to build TensorRT engine from {onnx_file_path}')
     TRT_LOGGER.log(TRT_LOGGER.INFO, 'Completed creating Engine')
     return serialized_engine
 
 def save_engine(engine, path):
     TRT_LOGGER.log(TRT_LOGGER.INFO, f'Saving engine to file {path}')
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, 'wb') as f:
-        f.write(engine)
+    atomic_write(path, engine)
     TRT_LOGGER.log(TRT_LOGGER.INFO, 'Completed saving engine')
 
-def load_engine(path):
-    if path.endswith('.onnx'):
-        # Create a cache directory in system temp
-        cache_dir = os.path.join(tempfile.gettempdir(), 'ezvtuber_rt_engines')
-        os.makedirs(cache_dir, exist_ok=True)
 
-        # Generate cache filename from ONNX path (hash or based on filename)
-        onnx_name = os.path.splitext(os.path.basename(path))[0]
-        engine_path = os.path.join(cache_dir, f'{onnx_name}.trt')
-
-        TRT_LOGGER.log(TRT_LOGGER.INFO, f'Building engine from ONNX: {path}')
-        engine = build_engine(path)
-        save_engine(engine, engine_path)
-        path = engine_path  # Use cached engine
-    TRT_LOGGER.log(TRT_LOGGER.WARNING, f'Loading engine from file {path}')
+def _deserialize_engine(path: Path):
+    """Validate and deserialize one engine, returning None when it is unusable."""
     runtime = trt.Runtime(TRT_LOGGER)
-    with open(path, 'rb') as f:
-        engine = runtime.deserialize_cuda_engine(f.read())
-    TRT_LOGGER.log(TRT_LOGGER.INFO, 'Completed loading engine')
+    try:
+        header_size = getattr(runtime, 'engine_header_size', None)
+        if hasattr(runtime, 'get_engine_validity') and header_size:
+            with open(path, 'rb') as engine_file:
+                header = engine_file.read(header_size)
+            if len(header) != header_size:
+                TRT_LOGGER.log(TRT_LOGGER.WARNING, f'Engine cache is truncated: {path}')
+                return None
+            validity, diagnostics = runtime.get_engine_validity(memoryview(header))
+            invalid = getattr(getattr(trt, 'EngineValidity', None), 'INVALID', None)
+            if invalid is not None and validity == invalid:
+                TRT_LOGGER.log(
+                    TRT_LOGGER.WARNING,
+                    f'Engine cache is incompatible (diagnostics={diagnostics}): {path}',
+                )
+                return None
+
+        with open(path, 'rb') as engine_file:
+            engine = runtime.deserialize_cuda_engine(engine_file.read())
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+        TRT_LOGGER.log(TRT_LOGGER.WARNING, f'Unable to load engine cache {path}: {error}')
+        return None
+
+    if engine is None:
+        TRT_LOGGER.log(TRT_LOGGER.WARNING, f'Engine deserialization failed: {path}')
     return engine
+
+def load_engine(path):
+    source_path = Path(path)
+    if source_path.suffix.lower() != '.onnx':
+        TRT_LOGGER.log(TRT_LOGGER.WARNING, f'Loading engine from file {source_path}')
+        engine = _deserialize_engine(source_path)
+        if engine is None:
+            raise RuntimeError(f'Failed to load TensorRT engine: {source_path}')
+        TRT_LOGGER.log(TRT_LOGGER.INFO, 'Completed loading engine')
+        return engine
+
+    engine_path = get_engine_cache_path(str(source_path))
+    if engine_path.is_file():
+        TRT_LOGGER.log(TRT_LOGGER.INFO, f'Loading cached engine: {engine_path}')
+        engine = _deserialize_engine(engine_path)
+        if engine is not None:
+            return engine
+
+    # Recheck after taking the lock: another EasyVtuber process may have built it.
+    with engine_build_lock(engine_path):
+        if engine_path.is_file():
+            engine = _deserialize_engine(engine_path)
+            if engine is not None:
+                return engine
+
+        TRT_LOGGER.log(TRT_LOGGER.INFO, f'Building engine from ONNX: {source_path}')
+        serialized_engine = build_engine(str(source_path))
+        save_engine(serialized_engine, engine_path)
+        engine = _deserialize_engine(engine_path)
+        if engine is None:
+            raise RuntimeError(f'Newly built TensorRT engine could not be loaded: {engine_path}')
+        return engine
