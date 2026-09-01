@@ -60,17 +60,23 @@ def pace_gpu_startup(started_at: float, operation: str) -> float:
 
 
 def _trt_cache_identity() -> str:
+    device_id_text = os.environ.get("EZVTB_DEVICE_ID", "0")
     identity = [
         getattr(trt, '__version__', 'unknown'),
-        f'device-id={os.environ.get("EZVTB_DEVICE_ID", "0")}',
+        f'device-id={device_id_text}',
     ]
     try:
-        device = cuda.Context.get_device()
+        # Query the configured device directly instead of consulting the active
+        # context.  The latter made cache keys depend on import/startup order:
+        # calls before ``pycuda.autoinit`` omitted the GPU identity while calls
+        # after it included one, causing needless duplicate engine builds.
+        cuda.init()
+        device = cuda.Device(int(device_id_text))
         identity.append(f'name={device.name()}')
         identity.append(f'cc={device.compute_capability()}')
     except Exception:
-        # Cache loading can be inspected in CPU-only tests or before a CUDA
-        # context exists. TensorRT deserialization remains the final guard.
+        # Cache paths can still be inspected on systems without a CUDA driver.
+        # TensorRT deserialization remains the final compatibility guard.
         pass
     return '|'.join(identity)
 

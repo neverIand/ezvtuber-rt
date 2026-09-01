@@ -47,6 +47,17 @@ class FakeRuntime:
         return {"payload": payload}
 
 
+class FakeCudaDevice:
+    def __init__(self, device_id):
+        self.device_id = device_id
+
+    def name(self):
+        return f"Fake GPU {self.device_id}"
+
+    def compute_capability(self):
+        return (9, 9)
+
+
 @contextmanager
 def loaded_trt_utils():
     fake_package = types.ModuleType("ezvtb_rt")
@@ -61,6 +72,8 @@ def loaded_trt_utils():
     fake_pycuda = types.ModuleType("pycuda")
     fake_pycuda.__path__ = []
     fake_cuda = types.ModuleType("pycuda.driver")
+    fake_cuda.init = mock.Mock()
+    fake_cuda.Device = FakeCudaDevice
     fake_pycuda.driver = fake_cuda
 
     replacements = {
@@ -83,6 +96,19 @@ def loaded_trt_utils():
 
 
 class TensorRTUtilsTests(unittest.TestCase):
+    def test_cache_identity_does_not_require_an_active_context(self):
+        with loaded_trt_utils() as trt_utils, mock.patch.dict(
+            os.environ,
+            {"EZVTB_DEVICE_ID": "1"},
+        ):
+            identity = trt_utils._trt_cache_identity()
+
+            self.assertEqual(
+                identity,
+                "1.3-test|device-id=1|name=Fake GPU 1|cc=(9, 9)",
+            )
+            trt_utils.cuda.init.assert_called_once_with()
+
     def test_onnx_engine_is_built_once_then_reused(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
