@@ -1,7 +1,9 @@
 import importlib.util
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).parents[1] / "ezvtb_rt" / "trt_cache.py"
@@ -158,6 +160,103 @@ class TensorRTCacheTests(unittest.TestCase):
             self.assertEqual(trt_cache.get_cache_usage(cache_dir), (0, 0))
             self.assertEqual(trt_cache.list_cache_locks(cache_dir), [])
             self.assertFalse(cache_dir.exists())
+
+    def test_default_cache_dir_is_persistent_and_override_still_wins(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            local_app_data = root / "local"
+            override = root / "override"
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "LOCALAPPDATA": str(local_app_data),
+                    trt_cache.ENGINE_CACHE_ENV: "",
+                },
+            ):
+                self.assertEqual(
+                    trt_cache.resolve_cache_dir(),
+                    local_app_data / "EasyVtuber" / "trt-cache",
+                )
+                os.environ[trt_cache.ENGINE_CACHE_ENV] = str(override)
+                self.assertEqual(trt_cache.resolve_cache_dir(), override)
+
+    def test_default_cache_migrates_valid_legacy_files_once(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            legacy = root / "legacy"
+            local_app_data = root / "local"
+            legacy.mkdir()
+            engine = legacy / "model-abc.trt"
+            runtime = legacy / "model-def.runtime.cache"
+            incomplete = legacy / ".model-abc.trt.random.tmp"
+            unrelated = legacy / "keep.txt"
+            engine.write_bytes(b"engine")
+            runtime.write_bytes(b"runtime")
+            incomplete.write_bytes(b"partial")
+            unrelated.write_bytes(b"keep")
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "LOCALAPPDATA": str(local_app_data),
+                    trt_cache.ENGINE_CACHE_ENV: "",
+                },
+            ), mock.patch.object(
+                trt_cache,
+                "get_legacy_cache_dir",
+                return_value=legacy,
+            ):
+                destination = trt_cache.get_cache_dir()
+                second_destination = trt_cache.get_cache_dir()
+
+            self.assertEqual(destination, local_app_data / "EasyVtuber" / "trt-cache")
+            self.assertEqual(second_destination, destination)
+            self.assertEqual((destination / engine.name).read_bytes(), b"engine")
+            self.assertEqual((destination / runtime.name).read_bytes(), b"runtime")
+            self.assertFalse(engine.exists())
+            self.assertFalse(runtime.exists())
+            self.assertEqual(incomplete.read_bytes(), b"partial")
+            self.assertEqual(unrelated.read_bytes(), b"keep")
+
+    def test_environment_override_does_not_migrate_legacy_cache(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            legacy = root / "legacy"
+            override = root / "override"
+            legacy.mkdir()
+            engine = legacy / "model.trt"
+            engine.write_bytes(b"engine")
+
+            with mock.patch.dict(
+                os.environ,
+                {trt_cache.ENGINE_CACHE_ENV: str(override)},
+            ), mock.patch.object(
+                trt_cache,
+                "get_legacy_cache_dir",
+                return_value=legacy,
+            ):
+                self.assertEqual(trt_cache.get_cache_dir(), override)
+
+            self.assertTrue(engine.exists())
+            self.assertFalse((override / engine.name).exists())
+
+    def test_legacy_migration_refuses_engine_build_lock(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            legacy = root / "legacy"
+            destination = root / "persistent"
+            legacy.mkdir()
+            engine = legacy / "model.trt"
+            lock = legacy / "model.trt.lock"
+            engine.write_bytes(b"engine")
+            lock.write_text("pid=123", encoding="utf-8")
+
+            with self.assertRaises(trt_cache.CacheInUseError):
+                trt_cache.migrate_legacy_cache(destination, legacy)
+
+            self.assertTrue(engine.exists())
+            self.assertTrue(lock.exists())
+            self.assertFalse(destination.exists())
 
 
 if __name__ == "__main__":

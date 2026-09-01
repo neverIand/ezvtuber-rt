@@ -9,6 +9,7 @@ from functools import lru_cache
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import time
 from typing import Iterator, List, Optional, Tuple, Union
@@ -18,6 +19,9 @@ PathLike = Union[str, os.PathLike]
 ENGINE_CACHE_SCHEMA = "2"
 RUNTIME_CACHE_SCHEMA = "1"
 ENGINE_CACHE_ENV = "EZVTB_TRT_CACHE_DIR"
+DEFAULT_CACHE_APP_DIR = "EasyVtuber"
+DEFAULT_CACHE_DIR_NAME = "trt-cache"
+LEGACY_CACHE_DIR_NAME = "ezvtuber_rt_engines"
 
 # Any change here can alter the serialized engine and therefore must produce a
 # new cache key. It mirrors build_engine() in trt_utils.py.
@@ -58,18 +62,38 @@ class CacheInUseError(RuntimeError):
     """Raised when a TensorRT engine build lock makes cleanup unsafe."""
 
 
+def get_default_cache_dir() -> Path:
+    """Return a persistent per-user cache directory for the current OS."""
+    cache_root = os.environ.get("LOCALAPPDATA")
+    if cache_root:
+        return Path(cache_root) / DEFAULT_CACHE_APP_DIR / DEFAULT_CACHE_DIR_NAME
+
+    cache_root = os.environ.get("XDG_CACHE_HOME")
+    if cache_root:
+        return Path(cache_root) / DEFAULT_CACHE_APP_DIR / DEFAULT_CACHE_DIR_NAME
+    return Path.home() / ".cache" / DEFAULT_CACHE_APP_DIR / DEFAULT_CACHE_DIR_NAME
+
+
+def get_legacy_cache_dir() -> Path:
+    """Return the temporary cache location used by older EasyVtuber builds."""
+    return Path(tempfile.gettempdir()) / LEGACY_CACHE_DIR_NAME
+
+
 def resolve_cache_dir(cache_dir: Optional[PathLike] = None) -> Path:
     """Return the configured cache directory without creating it."""
     if cache_dir is None:
         cache_dir = os.environ.get(ENGINE_CACHE_ENV)
-    if cache_dir is None:
-        cache_dir = Path(tempfile.gettempdir()) / "ezvtuber_rt_engines"
+    if not cache_dir:
+        cache_dir = get_default_cache_dir()
     return Path(cache_dir)
 
 
 def get_cache_dir(cache_dir: Optional[PathLike] = None) -> Path:
+    uses_default_cache = cache_dir is None and not os.environ.get(ENGINE_CACHE_ENV)
     result = resolve_cache_dir(cache_dir)
     result.mkdir(parents=True, exist_ok=True)
+    if uses_default_cache:
+        migrate_legacy_cache(result)
     return result
 
 
@@ -113,6 +137,97 @@ def list_cache_locks(cache_dir: Optional[PathLike] = None) -> List[Path]:
         )
     except FileNotFoundError:
         return []
+
+
+def _move_cache_file(source: Path, destination: Path) -> None:
+    """Move one cache file atomically, with a cross-volume copy fallback."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(source, destination)
+        return
+    except FileNotFoundError:
+        raise
+    except OSError:
+        pass
+
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".migration.tmp",
+        dir=str(destination.parent),
+    )
+    os.close(file_descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        shutil.copyfile(source, temporary_path)
+        os.replace(temporary_path, destination)
+        try:
+            source.unlink()
+        except OSError:
+            # The persistent copy is already complete.  A locked legacy file
+            # can safely remain for a later cleanup attempt.
+            pass
+    finally:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def migrate_legacy_cache(
+    cache_dir: Optional[PathLike] = None,
+    legacy_cache_dir: Optional[PathLike] = None,
+) -> Tuple[int, int]:
+    """Move valid legacy cache files into the persistent cache directory.
+
+    Migration is incremental and restart-safe: every destination update is an
+    atomic replace, incomplete ``.tmp`` files and unrelated files stay behind,
+    and a legacy engine-build lock makes migration fail closed.
+    """
+    destination_dir = resolve_cache_dir(cache_dir)
+    source_dir = (
+        get_legacy_cache_dir()
+        if legacy_cache_dir is None
+        else Path(legacy_cache_dir)
+    )
+    if source_dir.resolve() == destination_dir.resolve():
+        return 0, 0
+
+    locks = list_cache_locks(source_dir)
+    if locks:
+        raise CacheInUseError(
+            "Legacy TensorRT cache is in use by an engine build: "
+            + ", ".join(path.name for path in locks)
+        )
+
+    candidates = [
+        path
+        for path in list_cache_files(source_dir)
+        if not path.name.endswith(".tmp")
+    ]
+    if not candidates:
+        return 0, 0
+
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    migrated_count = 0
+    migrated_bytes = 0
+    for source in candidates:
+        destination = destination_dir / source.name
+        if destination.exists():
+            continue
+        try:
+            size = source.stat().st_size
+            _move_cache_file(source, destination)
+        except FileNotFoundError:
+            continue
+        migrated_count += 1
+        migrated_bytes += size
+
+    try:
+        source_dir.rmdir()
+    except (FileNotFoundError, OSError):
+        pass
+
+    return migrated_count, migrated_bytes
 
 
 def get_cache_usage(cache_dir: Optional[PathLike] = None) -> Tuple[int, int]:
