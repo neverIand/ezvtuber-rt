@@ -7,6 +7,7 @@ file handling can be tested without initializing a GPU runtime.
 from contextlib import contextmanager
 from functools import lru_cache
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -22,6 +23,8 @@ ENGINE_CACHE_ENV = "EZVTB_TRT_CACHE_DIR"
 DEFAULT_CACHE_APP_DIR = "EasyVtuber"
 DEFAULT_CACHE_DIR_NAME = "trt-cache"
 LEGACY_CACHE_DIR_NAME = "ezvtuber_rt_engines"
+HASH_MANIFEST_SCHEMA = 1
+HASH_MANIFEST_NAME = "hash-manifest-v1.json"
 
 # Any change here can alter the serialized engine and therefore must produce a
 # new cache key. It mirrors build_engine() in trt_utils.py.
@@ -46,16 +49,108 @@ def _sha256_for_file_state(
     return digest.hexdigest()
 
 
-def file_sha256(path: PathLike) -> str:
-    """Return a content digest, avoiding duplicate reads within one process."""
+def _load_hash_manifest(cache_dir: Path) -> dict:
+    manifest_path = cache_dir / HASH_MANIFEST_NAME
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    if payload.get("schema") != HASH_MANIFEST_SCHEMA:
+        return {}
+    files = payload.get("files")
+    return files if isinstance(files, dict) else {}
+
+
+def _valid_manifest_digest(entry, stat) -> Optional[str]:
+    if not isinstance(entry, dict):
+        return None
+    digest = entry.get("sha256")
+    if not (
+        isinstance(digest, str)
+        and len(digest) == 64
+        and all(character in "0123456789abcdef" for character in digest)
+    ):
+        return None
+    expected_state = (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    stored_state = (
+        entry.get("size"),
+        entry.get("mtime_ns"),
+        entry.get("ctime_ns"),
+    )
+    return digest if stored_state == expected_state else None
+
+
+def _store_hash_manifest_entry(
+    cache_dir: Path,
+    key: str,
+    stat,
+    digest: str,
+) -> None:
+    try:
+        files = _load_hash_manifest(cache_dir)
+        files[key] = {
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "ctime_ns": stat.st_ctime_ns,
+            "sha256": digest,
+        }
+        payload = json.dumps(
+            {"schema": HASH_MANIFEST_SCHEMA, "files": files},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        atomic_write(cache_dir / HASH_MANIFEST_NAME, payload)
+    except (OSError, TypeError, ValueError):
+        # The manifest is a startup optimization only.  Hashing remains the
+        # source of truth when it cannot be persisted.
+        pass
+
+
+def file_sha256(
+    path: PathLike,
+    manifest_cache_dir: Optional[PathLike] = None,
+) -> str:
+    """Return a content digest with optional cross-process memoization."""
     resolved = str(Path(path).resolve())
     stat = os.stat(resolved)
-    return _sha256_for_file_state(
+    manifest_dir = (
+        None if manifest_cache_dir is None else Path(manifest_cache_dir)
+    )
+    manifest_key = os.path.normcase(resolved)
+    if manifest_dir is not None:
+        digest = _valid_manifest_digest(
+            _load_hash_manifest(manifest_dir).get(manifest_key),
+            stat,
+        )
+        if digest is not None:
+            return digest
+
+    digest = _sha256_for_file_state(
         resolved,
         stat.st_size,
         stat.st_mtime_ns,
         stat.st_ctime_ns,
     )
+    current_stat = os.stat(resolved)
+    original_state = (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    current_state = (
+        current_stat.st_size,
+        current_stat.st_mtime_ns,
+        current_stat.st_ctime_ns,
+    )
+    if current_state != original_state:
+        return file_sha256(path, manifest_cache_dir)
+    if manifest_dir is not None:
+        _store_hash_manifest_entry(
+            manifest_dir,
+            manifest_key,
+            current_stat,
+            digest,
+        )
+    return digest
 
 
 class CacheInUseError(RuntimeError):
@@ -104,10 +199,16 @@ def _is_managed_cache_file(path: Path) -> bool:
     name = path.name
     if name.endswith(".trt") or name.endswith(".runtime.cache"):
         return True
+    if name == HASH_MANIFEST_NAME:
+        return True
     return (
         name.startswith(".")
         and name.endswith(".tmp")
-        and (".trt." in name or ".runtime.cache." in name)
+        and (
+            ".trt." in name
+            or ".runtime.cache." in name
+            or HASH_MANIFEST_NAME in name
+        )
     )
 
 
@@ -383,13 +484,14 @@ def get_engine_cache_path(
 ) -> Path:
     """Return a collision-safe path for one ONNX model and builder setup."""
     source = Path(onnx_path)
+    directory = get_cache_dir(cache_dir)
     token = _cache_token(
         ENGINE_CACHE_SCHEMA,
         trt_version,
         BUILDER_CONFIG_FINGERPRINT,
-        file_sha256(source),
+        file_sha256(source, directory),
     )
-    return get_cache_dir(cache_dir) / f"{source.stem}-{token}.trt"
+    return directory / f"{source.stem}-{token}.trt"
 
 
 def get_runtime_cache_path(
@@ -399,13 +501,14 @@ def get_runtime_cache_path(
 ) -> Path:
     """Return a GPU/runtime-validated JIT cache path for an engine source."""
     source = Path(source_path)
+    directory = get_cache_dir(cache_dir)
     token = _cache_token(
         RUNTIME_CACHE_SCHEMA,
         trt_version,
         BUILDER_CONFIG_FINGERPRINT,
-        file_sha256(source),
+        file_sha256(source, directory),
     )
-    return get_cache_dir(cache_dir) / f"{source.stem}-{token}.runtime.cache"
+    return directory / f"{source.stem}-{token}.runtime.cache"
 
 
 def atomic_write(path: PathLike, data) -> None:

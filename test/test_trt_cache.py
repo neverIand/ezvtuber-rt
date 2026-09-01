@@ -117,6 +117,7 @@ class TensorRTCacheTests(unittest.TestCase):
             engine = cache_dir / "model-abc.trt"
             runtime = cache_dir / "model-def.runtime.cache"
             temporary = cache_dir / ".model-abc.trt.random.tmp"
+            manifest = cache_dir / trt_cache.HASH_MANIFEST_NAME
             unrelated = cache_dir / "keep-me.txt"
             nested = cache_dir / "nested"
             nested.mkdir()
@@ -125,16 +126,18 @@ class TensorRTCacheTests(unittest.TestCase):
             engine.write_bytes(b"engine")
             runtime.write_bytes(b"runtime")
             temporary.write_bytes(b"temporary")
+            manifest.write_bytes(b"{}")
             unrelated.write_bytes(b"unrelated")
             nested_engine.write_bytes(b"nested")
 
-            self.assertEqual(trt_cache.get_cache_usage(cache_dir), (3, 22))
+            self.assertEqual(trt_cache.get_cache_usage(cache_dir), (4, 24))
             deleted_count, deleted_bytes = trt_cache.clear_cache(cache_dir)
 
-            self.assertEqual((deleted_count, deleted_bytes), (3, 22))
+            self.assertEqual((deleted_count, deleted_bytes), (4, 24))
             self.assertFalse(engine.exists())
             self.assertFalse(runtime.exists())
             self.assertFalse(temporary.exists())
+            self.assertFalse(manifest.exists())
             self.assertEqual(unrelated.read_bytes(), b"unrelated")
             self.assertEqual(nested_engine.read_bytes(), b"nested")
             self.assertTrue(cache_dir.is_dir())
@@ -293,6 +296,64 @@ class TensorRTCacheTests(unittest.TestCase):
                     )
 
             self.assertFalse(lock.exists())
+
+    def test_hash_manifest_reuses_digest_after_memory_cache_clear(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "model.onnx"
+            cache_dir = root / "cache"
+            cache_dir.mkdir()
+            source.write_bytes(b"model-content")
+
+            first = trt_cache.file_sha256(source, cache_dir)
+            trt_cache._sha256_for_file_state.cache_clear()
+            with mock.patch.object(
+                trt_cache,
+                "_sha256_for_file_state",
+                side_effect=AssertionError("file should not be rehashed"),
+            ):
+                second = trt_cache.file_sha256(source, cache_dir)
+
+            self.assertEqual(second, first)
+            self.assertTrue((cache_dir / trt_cache.HASH_MANIFEST_NAME).is_file())
+
+    def test_hash_manifest_invalidates_when_source_changes(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "model.onnx"
+            cache_dir = root / "cache"
+            cache_dir.mkdir()
+            source.write_bytes(b"model-a")
+            first = trt_cache.file_sha256(source, cache_dir)
+            first_mtime = source.stat().st_mtime_ns
+
+            source.write_bytes(b"model-b")
+            os.utime(source, ns=(first_mtime + 1_000_000, first_mtime + 1_000_000))
+            trt_cache._sha256_for_file_state.cache_clear()
+            second = trt_cache.file_sha256(source, cache_dir)
+
+            self.assertNotEqual(second, first)
+
+    def test_corrupt_hash_manifest_falls_back_to_full_hash(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "model.onnx"
+            cache_dir = root / "cache"
+            cache_dir.mkdir()
+            source.write_bytes(b"model-content")
+            manifest = cache_dir / trt_cache.HASH_MANIFEST_NAME
+            manifest.write_text("not-json", encoding="utf-8")
+
+            with mock.patch.object(
+                trt_cache,
+                "_sha256_for_file_state",
+                wraps=trt_cache._sha256_for_file_state,
+            ) as hasher:
+                digest = trt_cache.file_sha256(source, cache_dir)
+
+            self.assertEqual(len(digest), 64)
+            hasher.assert_called_once()
+            self.assertIn('"schema":1', manifest.read_text(encoding="utf-8"))
 
     def test_live_process_lock_is_not_removed_even_when_old(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
