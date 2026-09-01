@@ -3,9 +3,7 @@ Similar to tha_ort.py but adapted for THA4's 5-model architecture
 """
 import os
 import onnxruntime as ort
-import onnx
 import numpy as np
-from typing import List
 from ezvtb_rt.ort_utils import createORTSession
 
 

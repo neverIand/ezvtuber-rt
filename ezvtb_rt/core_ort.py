@@ -8,7 +8,16 @@ from ezvtb_rt.tha4_ort import THA4ORTSessions, THA4ORTNonDefaultSessions
 from ezvtb_rt.tha4_student_ort import THA4StudentORTSessions
 import ezvtb_rt
 from ezvtb_rt.ort_utils import createORTSession
-import pyanime4k
+
+
+def _create_anime4k_processor():
+    import pyanime4k
+
+    return pyanime4k.Processor(
+        processor_type="opencl",
+        device=0,
+        model="acnet-gan",
+    )
 
 
 def _mark_interpolated_frames(frames: np.ndarray) -> None:
@@ -106,11 +115,7 @@ class CoreORT:
         self.rife_model_scale: int = rife_model_scale
         self.sr: Optional[ort.InferenceSession] = None
         self.sr_cacher: Optional[Cacher] = None
-        self.sr_a4k = pyanime4k.Processor(
-            processor_type="opencl",
-            device=0,
-            model="acnet-gan"
-        ) if sr_a4k else None
+        self.sr_a4k = _create_anime4k_processor() if sr_a4k else None
         self.cacher: Optional[Cacher] = None
         self.last_tha_output: Optional[np.ndarray] = None
 

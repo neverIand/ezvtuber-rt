@@ -100,10 +100,6 @@ def load_core_trt_module():
             THA4StudentEngines=FakeStudent,
         ),
         "ezvtb_rt.cache": fake_cache_module,
-        "pyanime4k": types.SimpleNamespace(
-            Anime4K=object,
-            Processor=lambda **kwargs: object(),
-        ),
         "cv2": types.ModuleType("cv2"),
     }
 

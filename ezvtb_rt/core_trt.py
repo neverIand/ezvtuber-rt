@@ -8,8 +8,17 @@ import ezvtb_rt
 import numpy as np
 import os
 from typing import List
-import pyanime4k
 import cv2
+
+
+def _create_anime4k_processor():
+    import pyanime4k
+
+    return pyanime4k.Processor(
+        processor_type="opencl",
+        device=0,
+        model="acnet-gan",
+    )
 
 
 def _mark_interpolated_frames(frames: np.ndarray) -> None:
@@ -169,11 +178,7 @@ class CoreTRT:
         self.sr: TRTEngine = None    # Super resolution module
         self.cacher: Cacher = None# Output caching system
         self.sr_cacher: Cacher = None # SR output caching
-        self.sr_a4k = pyanime4k.Processor(
-                processor_type="opencl",
-                device=0,
-                model="acnet-gan"
-            ) if sr_a4k else None
+        self.sr_a4k = _create_anime4k_processor() if sr_a4k else None
         self.last_tha_output: np.ndarray | None = None
 
         # Initialize RIFE if model path provided

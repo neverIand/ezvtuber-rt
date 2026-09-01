@@ -1,8 +1,6 @@
 import os
 import onnxruntime as ort
-import onnx
 import numpy as np
-from typing import List
 from ezvtb_rt.ort_utils import createORTSession
 
 class THA3ORTSessions:
