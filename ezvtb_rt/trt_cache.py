@@ -124,7 +124,7 @@ def list_cache_files(cache_dir: Optional[PathLike] = None) -> List[Path]:
 
 
 def list_cache_locks(cache_dir: Optional[PathLike] = None) -> List[Path]:
-    """List active TensorRT engine-build lock files without deleting them."""
+    """List TensorRT engine-build lock files without changing them."""
     directory = resolve_cache_dir(cache_dir)
     try:
         return sorted(
@@ -137,6 +137,99 @@ def list_cache_locks(cache_dir: Optional[PathLike] = None) -> List[Path]:
         )
     except FileNotFoundError:
         return []
+
+
+def _read_lock_pid(lock_path: Path) -> Optional[int]:
+    try:
+        fields = lock_path.read_text(encoding="utf-8").split()
+    except (OSError, UnicodeError):
+        return None
+    for field in fields:
+        if not field.startswith("pid="):
+            continue
+        try:
+            return int(field[4:])
+        except ValueError:
+            return None
+    return None
+
+
+def _is_process_alive(pid: int) -> bool:
+    """Check a PID without terminating it or importing optional packages."""
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        synchronize = 0x00100000
+        wait_timeout = 0x00000102
+        wait_failed = 0xFFFFFFFF
+        access_denied = 5
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_process.restype = wintypes.HANDLE
+        wait_for_single_object = kernel32.WaitForSingleObject
+        wait_for_single_object.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        wait_for_single_object.restype = wintypes.DWORD
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        handle = open_process(synchronize, False, pid)
+        if not handle:
+            # Protected processes may deny access even though they are alive.
+            return ctypes.get_last_error() == access_denied
+        try:
+            wait_result = wait_for_single_object(handle, 0)
+            return wait_result in (wait_timeout, wait_failed)
+        finally:
+            close_handle(handle)
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _remove_stale_lock(lock_path: Path, stale_after_seconds: float) -> bool:
+    """Remove a dead-PID or old malformed lock, returning whether it vanished."""
+    try:
+        pid = _read_lock_pid(lock_path)
+        if pid is not None:
+            if _is_process_alive(pid):
+                return False
+            lock_path.unlink()
+            return True
+
+        lock_age = time.time() - lock_path.stat().st_mtime
+        if lock_age > stale_after_seconds:
+            lock_path.unlink()
+            return True
+    except FileNotFoundError:
+        return True
+    return False
+
+
+def list_active_cache_locks(
+    cache_dir: Optional[PathLike] = None,
+    stale_after_seconds: float = 900.0,
+) -> List[Path]:
+    """Return live locks after safely pruning stale lock files."""
+    return [
+        lock_path
+        for lock_path in list_cache_locks(cache_dir)
+        if not _remove_stale_lock(lock_path, stale_after_seconds)
+    ]
 
 
 def _move_cache_file(source: Path, destination: Path) -> None:
@@ -192,7 +285,7 @@ def migrate_legacy_cache(
     if source_dir.resolve() == destination_dir.resolve():
         return 0, 0
 
-    locks = list_cache_locks(source_dir)
+    locks = list_active_cache_locks(source_dir)
     if locks:
         raise CacheInUseError(
             "Legacy TensorRT cache is in use by an engine build: "
@@ -250,7 +343,7 @@ def clear_cache(cache_dir: Optional[PathLike] = None) -> Tuple[int, int]:
     cleanup fail closed so the launcher cannot delete a cache being written.
     """
     directory = resolve_cache_dir(cache_dir)
-    locks = list_cache_locks(directory)
+    locks = list_active_cache_locks(directory)
     if locks:
         raise CacheInUseError(
             "TensorRT cache is in use by an engine build: "
@@ -354,12 +447,7 @@ def engine_build_lock(
                 os.O_CREAT | os.O_EXCL | os.O_WRONLY,
             )
         except FileExistsError:
-            try:
-                lock_age = time.time() - lock_path.stat().st_mtime
-                if lock_age > stale_after_seconds:
-                    lock_path.unlink()
-                    continue
-            except FileNotFoundError:
+            if _remove_stale_lock(lock_path, stale_after_seconds):
                 continue
 
             if time.monotonic() - started_at >= timeout_seconds:

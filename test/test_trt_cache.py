@@ -145,7 +145,7 @@ class TensorRTCacheTests(unittest.TestCase):
             engine = cache_dir / "model.trt"
             lock = cache_dir / "model.trt.lock"
             engine.write_bytes(b"engine")
-            lock.write_text("pid=123", encoding="utf-8")
+            lock.write_text(f"pid={os.getpid()}", encoding="utf-8")
 
             with self.assertRaises(trt_cache.CacheInUseError):
                 trt_cache.clear_cache(cache_dir)
@@ -249,7 +249,7 @@ class TensorRTCacheTests(unittest.TestCase):
             engine = legacy / "model.trt"
             lock = legacy / "model.trt.lock"
             engine.write_bytes(b"engine")
-            lock.write_text("pid=123", encoding="utf-8")
+            lock.write_text(f"pid={os.getpid()}", encoding="utf-8")
 
             with self.assertRaises(trt_cache.CacheInUseError):
                 trt_cache.migrate_legacy_cache(destination, legacy)
@@ -257,6 +257,67 @@ class TensorRTCacheTests(unittest.TestCase):
             self.assertTrue(engine.exists())
             self.assertTrue(lock.exists())
             self.assertFalse(destination.exists())
+
+    def test_current_process_is_reported_alive(self):
+        self.assertTrue(trt_cache._is_process_alive(os.getpid()))
+
+    def test_dead_process_lock_is_removed_immediately(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            lock = Path(temporary_directory) / "model.trt.lock"
+            lock.write_text("pid=123", encoding="utf-8")
+
+            with mock.patch.object(
+                trt_cache,
+                "_is_process_alive",
+                return_value=False,
+            ):
+                self.assertTrue(trt_cache._remove_stale_lock(lock, 900.0))
+
+            self.assertFalse(lock.exists())
+
+    def test_engine_build_lock_reclaims_dead_process_lock(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            engine = Path(temporary_directory) / "model.trt"
+            lock = Path(f"{engine}.lock")
+            lock.write_text("pid=123", encoding="utf-8")
+
+            with mock.patch.object(
+                trt_cache,
+                "_is_process_alive",
+                return_value=False,
+            ):
+                with trt_cache.engine_build_lock(engine, timeout_seconds=0.1):
+                    self.assertEqual(
+                        trt_cache._read_lock_pid(lock),
+                        os.getpid(),
+                    )
+
+            self.assertFalse(lock.exists())
+
+    def test_live_process_lock_is_not_removed_even_when_old(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            lock = Path(temporary_directory) / "model.trt.lock"
+            lock.write_text(f"pid={os.getpid()}", encoding="utf-8")
+            os.utime(lock, (1, 1))
+
+            self.assertFalse(trt_cache._remove_stale_lock(lock, 0.0))
+            self.assertTrue(lock.exists())
+
+    def test_old_malformed_lock_uses_age_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache_dir = Path(temporary_directory)
+            lock = cache_dir / "model.trt.lock"
+            lock.write_text("incomplete", encoding="utf-8")
+            os.utime(lock, (1, 1))
+
+            self.assertEqual(
+                trt_cache.list_active_cache_locks(
+                    cache_dir,
+                    stale_after_seconds=0.0,
+                ),
+                [],
+            )
+            self.assertFalse(lock.exists())
 
 
 if __name__ == "__main__":
