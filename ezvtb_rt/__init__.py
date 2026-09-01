@@ -26,24 +26,33 @@ def init_model_path(custom_path: str):
     """
     global EZVTB_DATA
     EZVTB_DATA = custom_path
-__all__ = ["init_model_path"]
+__all__ = ["init_model_path", "CoreTRT", "CoreORT"]
 
-# Import main classes for easy access
-try:
-    import os
-    from ezvtb_rt.trt_utils import cudaSetDevice
-    device_id = int(os.environ.get('EZVTB_DEVICE_ID', '0'))
-    cudaSetDevice(device_id)
-    import pycuda.autoinit  # Ensure PyCUDA is initialized for TensorRT
-    from ezvtb_rt.core_trt import CoreTRT
-    __all__.append("CoreTRT")
-except ImportError:
-    print("TensorRT or PyCUDA not available, CoreTRT disabled.")
-    # TensorRT not available
-    __all__ = []
 
-from ezvtb_rt.core_ort import CoreORT
-__all__.append("CoreORT")
+def __getattr__(name: str):
+    """Load only the backend requested by the caller.
+
+    In particular, importing ``ezvtb_rt`` or ``ezvtb_rt.core_ort`` must not
+    initialize CUDA on systems using DirectML.
+    """
+    if name == "CoreTRT":
+        from ezvtb_rt.trt_utils import cudaSetDevice
+
+        device_id = int(os.environ.get("EZVTB_DEVICE_ID", "0"))
+        cudaSetDevice(device_id)
+        import pycuda.autoinit  # Ensure PyCUDA is initialized after selecting the device.
+        from ezvtb_rt.core_trt import CoreTRT
+
+        globals()[name] = CoreTRT
+        return CoreTRT
+
+    if name == "CoreORT":
+        from ezvtb_rt.core_ort import CoreORT
+
+        globals()[name] = CoreORT
+        return CoreORT
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # Note: C++ extensions (rgba_utils, ffmpeg_codec) are not built by default.
 # They are available in ezvtb_rt/cpp/ for optional manual building if needed.
