@@ -1,4 +1,5 @@
 import importlib.util
+import os
 from pathlib import Path
 import sys
 import types
@@ -57,6 +58,13 @@ class FakeCacher:
         self.puts.append((key, np.copy(value)))
 
 
+class FakeStudent:
+    last_init = None
+
+    def __init__(self, model_dir, vram_cache_size):
+        type(self).last_init = (model_dir, vram_cache_size)
+
+
 def load_core_trt_module():
     fake_package = types.ModuleType("ezvtb_rt")
     fake_package.__path__ = [str(PACKAGE_DIR)]
@@ -64,6 +72,7 @@ def load_core_trt_module():
 
     fake_utils = types.ModuleType("ezvtb_rt.trt_utils")
     fake_utils.get_gpu_duty_limit_percent = lambda: 90.0
+    fake_utils.cuda = types.SimpleNamespace(Stream=FakeStream)
 
     fake_engine_module = types.ModuleType("ezvtb_rt.trt_engine")
     fake_engine_module.TRTEngine = object
@@ -76,6 +85,10 @@ def load_core_trt_module():
         array.shape,
         np.ascontiguousarray(array).tobytes(),
     )
+    fake_cache_module.split_ram_cache_budget = lambda total, sr_enabled: (
+        (total / 5.0, total * 4.0 / 5.0)
+        if sr_enabled else (total, 0.0)
+    )
 
     replacements = {
         "ezvtb_rt": fake_package,
@@ -83,9 +96,14 @@ def load_core_trt_module():
         "ezvtb_rt.trt_engine": fake_engine_module,
         "ezvtb_rt.tha3": types.SimpleNamespace(THA3Engines=object),
         "ezvtb_rt.tha4": types.SimpleNamespace(THA4Engines=object),
-        "ezvtb_rt.tha4_student": types.SimpleNamespace(THA4StudentEngines=object),
+        "ezvtb_rt.tha4_student": types.SimpleNamespace(
+            THA4StudentEngines=FakeStudent,
+        ),
         "ezvtb_rt.cache": fake_cache_module,
-        "pyanime4k": types.SimpleNamespace(Anime4K=object),
+        "pyanime4k": types.SimpleNamespace(
+            Anime4K=object,
+            Processor=lambda **kwargs: object(),
+        ),
         "cv2": types.ModuleType("cv2"),
     }
 
@@ -100,6 +118,22 @@ def load_core_trt_module():
 
 
 class CoreTRTCacheHitTests(unittest.TestCase):
+    def test_student_model_uses_configured_root_and_vram_budget(self):
+        module = load_core_trt_module()
+        FakeStudent.last_init = None
+
+        module.CoreTRT(
+            tha_model_version="v4_student",
+            tha_model_name="demo",
+            vram_cache_size=0.375,
+            cache_max_giga=0.0,
+        )
+
+        expected_path = os.path.normpath(
+            os.path.join("unused", "custom_tha4_models", "demo")
+        )
+        self.assertEqual(FakeStudent.last_init, (expected_path, 0.375))
+
     def test_plain_tha_cache_hit_returns_without_gpu_upload(self):
         module = load_core_trt_module()
         cached = np.full((512, 512, 4), 17, dtype=np.uint8)

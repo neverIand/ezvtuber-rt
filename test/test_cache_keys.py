@@ -46,6 +46,28 @@ class ArrayCacheKeyTests(unittest.TestCase):
         )
 
 
+class CacheBudgetTests(unittest.TestCase):
+    def test_without_super_resolution_the_base_cache_gets_the_full_budget(self):
+        self.assertEqual(
+            cache_module.split_ram_cache_budget(2.0, False),
+            (2.0, 0.0),
+        )
+
+    def test_super_resolution_budget_is_split_by_frame_byte_size(self):
+        base_giga, sr_giga = cache_module.split_ram_cache_budget(2.0, True)
+
+        self.assertAlmostEqual(base_giga, 0.4)
+        self.assertAlmostEqual(sr_giga, 1.6)
+        self.assertAlmostEqual(base_giga + sr_giga, 2.0)
+        self.assertAlmostEqual(sr_giga / base_giga, 4.0)
+
+    def test_nonpositive_budget_cannot_create_a_cache(self):
+        self.assertEqual(
+            cache_module.split_ram_cache_budget(-2.0, True),
+            (0.0, 0.0),
+        )
+
+
 class RawCacheTests(unittest.TestCase):
     def test_raw_mode_owns_exact_read_only_frame(self):
         frame = np.arange(8 * 8 * 4, dtype=np.uint8).reshape(8, 8, 4)

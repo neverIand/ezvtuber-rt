@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 import os
 from ezvtb_rt.tha3_ort import THA3ORTSessions, THA3ORTNonDefaultSessions
-from ezvtb_rt.cache import Cacher, array_cache_key
+from ezvtb_rt.cache import Cacher, array_cache_key, split_ram_cache_budget
 from ezvtb_rt.tha4_ort import THA4ORTSessions, THA4ORTNonDefaultSessions
 from ezvtb_rt.tha4_student_ort import THA4StudentORTSessions
 import ezvtb_rt
@@ -130,16 +130,20 @@ class CoreORT:
                 self.smaller_rifes.append(x3_rife)
         if sr_path is not None:
             self.sr = createORTSession(sr_path, device_id)
-        if cache_max_giga > 0.0 and sr_model_enable:
+        base_cache_giga, sr_cache_giga = split_ram_cache_budget(
+            cache_max_giga,
+            sr_model_enable or sr_a4k,
+        )
+        if sr_cache_giga > 0.0:
             self.sr_cacher = Cacher(
-                cache_max_giga,
+                sr_cache_giga,
                 width=1024,
                 height=1024,
                 storage_mode=cache_storage_mode,
             )
-        if cache_max_giga > 0.0:
+        if base_cache_giga > 0.0:
             self.cacher = Cacher(
-                cache_max_giga,
+                base_cache_giga,
                 storage_mode=cache_storage_mode,
             )
 

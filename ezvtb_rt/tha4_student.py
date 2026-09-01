@@ -30,7 +30,7 @@ class THA4StudentEngines():
         
         Args:
             model_dir: Directory containing TensorRT engine files
-            vram_cache_size: Total GPU memory for caching (MB)
+            vram_cache_size: Total GPU memory for caching (GB)
         """
         TRT_LOGGER.log(TRT_LOGGER.INFO, 'Creating Engines')
         self.face_morpher = TRTEngine(join(model_dir, 'face_morpher.onnx'), 1)

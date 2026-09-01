@@ -26,6 +26,24 @@ def array_cache_key(array: np.ndarray) -> Hashable:
     return contiguous.dtype.str, contiguous.shape, contiguous.tobytes()
 
 
+def split_ram_cache_budget(
+        total_giga: float,
+        super_resolution_enabled: bool,
+) -> tuple[float, float]:
+    """Split one RAM limit between 512px and 1024px frame caches.
+
+    A 1024x1024 RGBA frame contains four times as many bytes as a 512x512
+    frame. A 1:4 split therefore retains roughly the same number of poses in
+    both caches while ensuring their configured limits add up to the user's
+    single total budget.
+    """
+    total_giga = max(0.0, float(total_giga))
+    if total_giga == 0.0 or not super_resolution_enabled:
+        return total_giga, 0.0
+    base_cache_giga = total_giga / 5.0
+    return base_cache_giga, total_giga - base_cache_giga
+
+
 class Cacher:
     """Lossless LRU image cache.
 

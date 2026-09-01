@@ -3,7 +3,7 @@ from ezvtb_rt.trt_engine import TRTEngine, HostDeviceMem
 from ezvtb_rt.tha3 import THA3Engines
 from ezvtb_rt.tha4 import THA4Engines
 from ezvtb_rt.tha4_student import THA4StudentEngines
-from ezvtb_rt.cache import Cacher, array_cache_key
+from ezvtb_rt.cache import Cacher, array_cache_key, split_ram_cache_budget
 import ezvtb_rt
 import numpy as np
 import os
@@ -94,7 +94,7 @@ class CoreTRT:
         use_eyebrow: Enable eyebrow motion processing
         rife_dir: Path to RIFE model directory (None to disable)
         sr_dir: Path to SR model directory (None to disable) 
-        cache_max_giga: Max disk cache size (GB)
+        cache_max_giga: Total RAM cache size across base and SR frames (GB)
     """
     def __init__(self, 
                  tha_model_version:str = 'v3',
@@ -124,13 +124,10 @@ class CoreTRT:
         elif tha_model_version == 'v4_student':
             # Support custom student models in data/models/custom_tha4_models
             if tha_model_name:
-                # Build path relative to project root (parent of ezvtuber-rt)
-                project_root = os.path.dirname(
-                    os.path.dirname(os.path.dirname(__file__))
-                )
                 tha_path = os.path.normpath(os.path.join(
-                    project_root, 'data', 'models',
-                    'custom_tha4_models', tha_model_name
+                    ezvtb_rt.EZVTB_DATA,
+                    'custom_tha4_models',
+                    tha_model_name,
                 ))
             else:
                 tha_path = os.path.join(
@@ -157,7 +154,7 @@ class CoreTRT:
         if self.v3:
             self.tha = THA3Engines(tha_path, vram_cache_size, use_eyebrow)
         elif tha_model_version == 'v4_student':
-            self.tha = THA4StudentEngines(tha_path)
+            self.tha = THA4StudentEngines(tha_path, vram_cache_size)
         elif tha_model_version == 'v4':
             self.tha = THA4Engines(tha_path, vram_cache_size, use_eyebrow)
         else:
@@ -202,19 +199,23 @@ class CoreTRT:
         if sr_path is not None:
             self.sr = TRTEngine(sr_path, 1)
             self.sr.configure_in_out_tensors(rife_model_scale if rife_model_enable else 1)
-        if cache_max_giga > 0.0 and sr_model_enable:
+        base_cache_giga, sr_cache_giga = split_ram_cache_budget(
+            cache_max_giga,
+            sr_model_enable or sr_a4k,
+        )
+        if sr_cache_giga > 0.0:
             # SR outputs are upscaled (expected 1024x1024 RGBA)
             self.sr_cacher = Cacher(
-                cache_max_giga,
+                sr_cache_giga,
                 width=1024,
                 height=1024,
                 storage_mode=cache_storage_mode,
             )
 
         # Initialize cache if enabled
-        if cache_max_giga > 0.0:
+        if base_cache_giga > 0.0:
             self.cacher = Cacher(
-                cache_max_giga,
+                base_cache_giga,
                 storage_mode=cache_storage_mode,
             )
 
