@@ -52,7 +52,8 @@ class CoreORT:
                  sr_a4k: bool = False,
                  vram_cache_size: float = 1.0,
                  cache_max_giga: float = 2.0,
-                 use_eyebrow: bool = False):
+                 use_eyebrow: bool = False,
+                 cache_storage_mode: str = 'brotli'):
         if tha_model_version == 'v3':
             tha_path = os.path.join(ezvtb_rt.EZVTB_DATA, 'tha3',
                                     'seperable' if tha_model_seperable else 'standard',
@@ -130,15 +131,30 @@ class CoreORT:
         if sr_path is not None:
             self.sr = createORTSession(sr_path, device_id)
         if cache_max_giga > 0.0 and sr_model_enable:
-            self.sr_cacher = Cacher(cache_max_giga, width=1024, height=1024)
+            self.sr_cacher = Cacher(
+                cache_max_giga,
+                width=1024,
+                height=1024,
+                storage_mode=cache_storage_mode,
+            )
         if cache_max_giga > 0.0:
-            self.cacher = Cacher(cache_max_giga)
+            self.cacher = Cacher(
+                cache_max_giga,
+                storage_mode=cache_storage_mode,
+            )
 
     def setImage(self, img: np.ndarray):
         self.tha.update_image(img)
         self.last_tha_output = img
 
-    def inference(self, poses: List[np.ndarray]) -> np.ndarray:
+    def inference(
+            self,
+            poses: List[np.ndarray],
+            copy_output: bool = True,
+    ) -> np.ndarray:
+        # ONNX Runtime already returns independently owned NumPy outputs.  The
+        # keyword keeps the interface uniform with TensorRT's reusable host
+        # buffer without adding a redundant copy here.
         for i in range(len(poses)):
             poses[i] = poses[i].astype(np.float32)
             if self.tha_model_fp16 and not self.v3:  # For THA4 with FP16 model poses are fp16 inputs

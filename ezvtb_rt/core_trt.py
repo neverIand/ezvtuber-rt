@@ -66,6 +66,22 @@ def find_none_block_indices(lst):
     
     return i1, i2
 
+
+def _cache_rife_intermediate_frames(
+        cacher: Cacher,
+        poses: List[np.ndarray],
+        frames: np.ndarray,
+) -> None:
+    """Cache every RIFE-generated frame, excluding the final THA pose/frame."""
+    if cacher is None:
+        return
+    intermediate_count = len(poses) - 1
+    if frames.shape[0] < intermediate_count:
+        raise ValueError('RIFE output has fewer frames than input poses')
+    for index in range(intermediate_count):
+        cacher.put(array_cache_key(poses[index]), frames[index])
+
+
 class CoreTRT:
     """Main inference pipeline combining THA face model with optional components:
     - RIFE for frame interpolation
@@ -93,8 +109,9 @@ class CoreTRT:
                  sr_model_fp16:bool = False,
                  sr_a4k:bool = False,
                  vram_cache_size:float = 1.0, 
-                 cache_max_giga:float = 2.0, 
-                 use_eyebrow:bool = False):
+                 cache_max_giga:float = 2.0,
+                 use_eyebrow:bool = False,
+                 cache_storage_mode:str = 'brotli'):
         if tha_model_version == 'v3':
             tha_path = os.path.join(ezvtb_rt.EZVTB_DATA, 'tha3',
                                     'seperable' if tha_model_seperable else 'standard', 
@@ -187,11 +204,19 @@ class CoreTRT:
             self.sr.configure_in_out_tensors(rife_model_scale if rife_model_enable else 1)
         if cache_max_giga > 0.0 and sr_model_enable:
             # SR outputs are upscaled (expected 1024x1024 RGBA)
-            self.sr_cacher = Cacher(cache_max_giga, width=1024, height=1024)
+            self.sr_cacher = Cacher(
+                cache_max_giga,
+                width=1024,
+                height=1024,
+                storage_mode=cache_storage_mode,
+            )
 
         # Initialize cache if enabled
         if cache_max_giga > 0.0:
-            self.cacher = Cacher(cache_max_giga)
+            self.cacher = Cacher(
+                cache_max_giga,
+                storage_mode=cache_storage_mode,
+            )
 
         self.main_stream: cuda.Stream = cuda.Stream()
         self.cache_stream: cuda.Stream = cuda.Stream()
@@ -204,9 +229,13 @@ class CoreTRT:
         self.tha.syncSetImage(img)
         self.last_tha_output = img
 
-    def inference(self, poses: List[np.ndarray]) -> np.ndarray:
+    def inference(
+            self,
+            poses: List[np.ndarray],
+            copy_output: bool = True,
+    ) -> np.ndarray:
         try:
-            return self._inference(poses)
+            return self._inference(poses, copy_output=copy_output)
         finally:
             # VRAM cache copies run on a separate stream. In safety-limited
             # mode, wait here so the caller's duty-cycle timer includes that
@@ -216,7 +245,11 @@ class CoreTRT:
                 if cache_stream is not None:
                     cache_stream.synchronize()
 
-    def _inference(self, poses: List[np.ndarray]) -> np.ndarray:
+    def _inference(
+            self,
+            poses: List[np.ndarray],
+            copy_output: bool = True,
+    ) -> np.ndarray:
         """Run full inference pipeline
         Args:
             poses: One or more facial pose arrays. If multiple are provided,
@@ -248,7 +281,8 @@ class CoreTRT:
             cached_output = self.cacher.get(tha_pose_key)
             if cached_output is not None:
                 if self.rife is None and self.sr is None and self.sr_a4k is None:
-                    return np.expand_dims(cached_output, axis=0)
+                    output = np.copy(cached_output) if copy_output else cached_output
+                    return np.expand_dims(output, axis=0)
                 np.copyto(tha_mem_res.host, cached_output)
                 tha_mem_res.htod(self.main_stream)
         # Run THA when not cached
@@ -262,7 +296,8 @@ class CoreTRT:
 
         # If no RIFE and no SR, just return THA result
         if self.rife is None and self.sr is None and self.sr_a4k is None:
-            return np.expand_dims(np.copy(tha_mem_res.host), axis=0)
+            output = np.copy(tha_mem_res.host) if copy_output else tha_mem_res.host
+            return np.expand_dims(output, axis=0)
         
         # RIFE interpolation stage
         rife_mem_res : HostDeviceMem = None
@@ -389,9 +424,11 @@ class CoreTRT:
                     np.copyto(rife_mem_res.host, rife_result)
                     rife_mem_res.htod(self.main_stream)
                     self.main_stream.synchronize()
-                if self.cacher is not None:
-                    for i in range(1, len(poses) -1):
-                        self.cacher.put(array_cache_key(poses[i]), rife_mem_res.host[i])
+                _cache_rife_intermediate_frames(
+                    self.cacher,
+                    poses,
+                    rife_mem_res.host,
+                )
             # Track last THA output for future interpolation
             self.last_tha_output = np.copy(tha_mem_res.host)
         else:
@@ -400,7 +437,7 @@ class CoreTRT:
         
         if self.sr is None and self.sr_a4k is None:
             _mark_interpolated_frames(rife_mem_res.host)
-            return np.copy(rife_mem_res.host)
+            return np.copy(rife_mem_res.host) if copy_output else rife_mem_res.host
         
         if self.sr is not None:
             return self.sr_trt_process(poses, rife_mem_res)

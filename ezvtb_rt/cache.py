@@ -1,13 +1,18 @@
 import numpy as np
 from collections import OrderedDict
-import brotli
 from typing import Hashable, Optional
 
 """
-Cache system with compression and LRU eviction.
-Handles image data with synchronous compression/decompression.
-Uses HuffYUV for efficient compression/decompression.
+Lossless image cache with raw/Brotli storage and LRU eviction.
 """
+
+
+def _brotli_module():
+    # Raw mode is the EasyVtuber fast path and should not require importing the
+    # optional legacy compression dependency at runtime.
+    import brotli
+
+    return brotli
 
 
 def array_cache_key(array: np.ndarray) -> Hashable:
@@ -22,29 +27,44 @@ def array_cache_key(array: np.ndarray) -> Hashable:
 
 
 class Cacher:
-    """Main cache interface with synchronous compression.
+    """Lossless LRU image cache.
+
+    ``brotli`` preserves the legacy high-capacity behavior.  ``raw`` stores an
+    owned, read-only contiguous array and removes compression/decompression
+    from the frame hot path.  Both modes enforce the configured byte budget.
     
     Attributes:
-        cache: OrderedDict storing compressed entries
-        encoder: HuffYUV encoder for compression
-        decoder: HuffYUV decoder for decompression
+        cache: OrderedDict storing compressed bytes or raw arrays
         max_kbytes: Maximum cache size in kilobytes
         cached_kbytes: Current cache size in kilobytes
         hits: Total cache hits
         miss: Total cache misses
-        continues_hits: Counter for sequential hits (anti-thrashing)
-        last_hs: Last accessed hash key
     """
     
-    def __init__(self, max_volume_giga:float = 2.0, width:int = 512, height:int = 512):
+    def __init__(
+            self,
+            max_volume_giga: float = 2.0,
+            width: int = 512,
+            height: int = 512,
+            storage_mode: str = "brotli",
+    ):
         """Initialize cache with specified size.
         
         Args:
             max_volume_giga: Maximum cache size in gigabytes (default 2.0)
+            storage_mode: ``brotli`` for compressed entries or ``raw`` for the
+                low-latency, lossless in-memory fast path.
         """
+        if storage_mode not in ("brotli", "raw"):
+            raise ValueError(
+                "storage_mode must be either 'brotli' or 'raw', got {!r}".format(
+                    storage_mode
+                )
+            )
         self.cache = OrderedDict()  # LRU cache storage
         self.width = width
         self.height = height
+        self.storage_mode = storage_mode
         
         # Cache size management
         self.max_kbytes = max_volume_giga * 1024 * 1024  # Convert GB to KB
@@ -79,8 +99,12 @@ class Cacher:
         if cached is not None:
             self.hits += 1
             self.cache.move_to_end(hs)
-            result_img = np.frombuffer(brotli.decompress(cached), dtype=np.uint8).reshape((self.height, self.width, 4))
-            return result_img
+            if self.storage_mode == "raw":
+                return cached
+            return np.frombuffer(
+                _brotli_module().decompress(cached),
+                dtype=np.uint8,
+            ).reshape((self.height, self.width, 4))
         else:
             self.miss += 1
             return None
@@ -96,15 +120,41 @@ class Cacher:
         if hs in self.cache:
             return
             
-        # Compress data
-        compressed = brotli.compress(data.data, quality=0)
-        
-        # Add to cache and update size tracking
-        self.cache[hs] = compressed
-        self.cached_kbytes += len(compressed) / 1024  # Track size in KB
-        
-        # LRU eviction when over capacity
-        while self.cached_kbytes > self.max_kbytes:
-            poped = self.cache.popitem(last=False)  # Remove oldest entry
-            self.cached_kbytes -= len(poped[1]) / 1024
-            poped = None  # Allow GC
+        if self.storage_mode == "raw":
+            payload_kbytes = data.nbytes / 1024
+            payload = None
+        else:
+            payload = _brotli_module().compress(
+                np.ascontiguousarray(data).tobytes(),
+                quality=0,
+            )
+            payload_kbytes = len(payload) / 1024
+
+        # An entry larger than the complete budget can never be retained.  Do
+        # not evict useful entries or transiently exceed the configured size.
+        if payload_kbytes > self.max_kbytes:
+            return
+
+        # Evict before insertion so the cache remains within its budget even
+        # at the instant a new raw frame is added.
+        while self.cache and self.cached_kbytes + payload_kbytes > self.max_kbytes:
+            _, evicted = self.cache.popitem(last=False)
+            self.cached_kbytes -= self._payload_kbytes(evicted)
+
+        if self.storage_mode == "raw":
+            # Copy only after making room so retained cache memory never
+            # exceeds the configured budget, even transiently.
+            payload = np.array(data, copy=True, order="C")
+            # Compressed entries were already effectively read-only because
+            # ``np.frombuffer(bytes)`` is read-only.  Match that contract and
+            # protect cached frames from debug overlays or external mutation.
+            payload.flags.writeable = False
+
+        self.cache[hs] = payload
+        self.cached_kbytes += payload_kbytes
+
+    @staticmethod
+    def _payload_kbytes(payload) -> float:
+        if isinstance(payload, np.ndarray):
+            return payload.nbytes / 1024
+        return len(payload) / 1024

@@ -23,9 +23,13 @@ class FakeOutputMemory:
     def __init__(self):
         self.host = np.zeros((512, 512, 4), dtype=np.uint8)
         self.htod_calls = 0
+        self.dtoh_calls = 0
 
     def htod(self, stream):
         self.htod_calls += 1
+
+    def dtoh(self, stream):
+        self.dtoh_calls += 1
 
 
 class FakeTHA:
@@ -44,9 +48,13 @@ class FakeTHA:
 class FakeCacher:
     def __init__(self, cached):
         self.cached = cached
+        self.puts = []
 
     def get(self, key):
         return self.cached
+
+    def put(self, key, value):
+        self.puts.append((key, np.copy(value)))
 
 
 def load_core_trt_module():
@@ -78,6 +86,7 @@ def load_core_trt_module():
         "ezvtb_rt.tha4_student": types.SimpleNamespace(THA4StudentEngines=object),
         "ezvtb_rt.cache": fake_cache_module,
         "pyanime4k": types.SimpleNamespace(Anime4K=object),
+        "cv2": types.ModuleType("cv2"),
     }
 
     with mock.patch.dict(sys.modules, replacements):
@@ -111,6 +120,54 @@ class CoreTRTCacheHitTests(unittest.TestCase):
         self.assertEqual(core.tha.infer_calls, 0)
         self.assertEqual(core.tha.output_memory.htod_calls, 0)
         self.assertEqual(core.tha.cachestream.sync_calls, 1)
+
+    def test_copy_output_false_exposes_reusable_host_buffer(self):
+        module = load_core_trt_module()
+        core = object.__new__(module.CoreTRT)
+        core.cacher = None
+        core.cache_stream = FakeStream()
+        core.main_stream = FakeStream()
+        core.tha = FakeTHA()
+        core.tha_model_fp16 = False
+        core.v3 = True
+        core.rife = None
+        core.sr = None
+        core.sr_a4k = None
+
+        result = core.inference(
+            [np.zeros(45, dtype=np.float32)],
+            copy_output=False,
+        )
+
+        self.assertTrue(np.shares_memory(result[0], core.tha.output_memory.host))
+        self.assertEqual(core.tha.output_memory.dtoh_calls, 1)
+
+    def test_rife_cache_records_every_intermediate_pose_for_all_scales(self):
+        module = load_core_trt_module()
+        for scale in (2, 3, 4):
+            with self.subTest(scale=scale):
+                poses = [
+                    np.full(45, index, dtype=np.float32)
+                    for index in range(scale)
+                ]
+                frames = np.stack(
+                    [
+                        np.full((2, 2, 4), index + 10, dtype=np.uint8)
+                        for index in range(scale)
+                    ],
+                    axis=0,
+                )
+                cacher = FakeCacher(None)
+
+                module._cache_rife_intermediate_frames(cacher, poses, frames)
+
+                self.assertEqual(len(cacher.puts), scale - 1)
+                for index, (key, cached_frame) in enumerate(cacher.puts):
+                    self.assertEqual(
+                        key,
+                        (poses[index].dtype.str, poses[index].shape, poses[index].tobytes()),
+                    )
+                    np.testing.assert_array_equal(cached_frame, frames[index])
 
 
 if __name__ == "__main__":
