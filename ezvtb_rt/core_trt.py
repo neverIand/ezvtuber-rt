@@ -219,7 +219,6 @@ class CoreTRT:
             )
 
         self.main_stream: cuda.Stream = cuda.Stream()
-        self.cache_stream: cuda.Stream = cuda.Stream()
 
     def setImage(self, img:np.ndarray):
         """Set input image for processing pipeline
@@ -276,7 +275,6 @@ class CoreTRT:
         tha_pose_key = None
         # THA cache lookup for the last pose only (matches ORT semantics)
         if self.cacher is not None:
-            self.cache_stream.synchronize()
             tha_pose_key = array_cache_key(tha_pose)
             cached_output = self.cacher.get(tha_pose_key)
             if cached_output is not None:

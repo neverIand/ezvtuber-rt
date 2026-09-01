@@ -12,6 +12,18 @@ import os
 from pathlib import Path
 import time
 
+
+PROFILE_INFERENCE_ENV = 'EZVTB_TRT_PROFILE'
+
+
+def _profile_inference_enabled() -> bool:
+    return os.environ.get(PROFILE_INFERENCE_ENV, '').strip().lower() in (
+        '1',
+        'true',
+        'yes',
+        'on',
+    )
+
 #memory management
 class HostDeviceMem(object):
     def __init__(self, host_mem:numpy.ndarray, device_mem: cuda.DeviceAllocation):
@@ -44,7 +56,12 @@ class HostDeviceMem(object):
 
 
 class TRTEngine:
-    def __init__(self, engine: trt.ICudaEngine | str, n_input:int):
+    def __init__(
+            self,
+            engine: trt.ICudaEngine | str,
+            n_input:int,
+            profile_inference: bool | None = None,
+    ):
         source_path = os.fspath(engine) if isinstance(engine, (str, os.PathLike)) else None
         if source_path is not None:
             engine = load_engine(source_path)
@@ -117,11 +134,25 @@ class TRTEngine:
 
         # create stream
         self.stream: cuda.Stream = cuda.Stream()
-        # For measuring inference time
-        self.start_event: cuda.Event = cuda.Event()
-        self.end_event: cuda.Event = cuda.Event()
+        # CUDA timing events add work to every enqueue. Keep them disabled in
+        # normal operation and create them only for an explicit profiling run.
+        if profile_inference is None:
+            profile_inference = _profile_inference_enabled()
+        self.profile_inference = bool(profile_inference)
+        self.start_event: cuda.Event | None = (
+            cuda.Event() if self.profile_inference else None
+        )
+        self.end_event: cuda.Event | None = (
+            cuda.Event() if self.profile_inference else None
+        )
             
     def get_last_inference_time(self):
+        if self.start_event is None or self.end_event is None:
+            raise RuntimeError(
+                'TensorRT inference profiling is disabled; pass '
+                'profile_inference=True or set EZVTB_TRT_PROFILE=1 before '
+                'creating the engine'
+            )
         return self.start_event.time_till(self.end_event)
 
     def _persist_runtime_cache(self):
@@ -164,12 +195,12 @@ class TRTEngine:
     def kickoff(self, stream: cuda.Stream = None, sync:bool = False):
         if stream is None:
             stream = self.stream
-        # Record the start event
-        self.start_event.record(stream)
+        if self.start_event is not None:
+            self.start_event.record(stream)
         # Run inference.
         self.context.execute_async_v3(stream.handle)
-        # Record the end event
-        self.end_event.record(stream)
+        if self.end_event is not None:
+            self.end_event.record(stream)
         if self._runtime_cache_save_pending:
             self._persist_runtime_cache()
             self._runtime_cache_save_pending = False

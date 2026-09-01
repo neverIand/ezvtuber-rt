@@ -105,7 +105,6 @@ class CoreTRTCacheHitTests(unittest.TestCase):
         cached = np.full((512, 512, 4), 17, dtype=np.uint8)
         core = object.__new__(module.CoreTRT)
         core.cacher = FakeCacher(cached)
-        core.cache_stream = FakeStream()
         core.main_stream = FakeStream()
         core.tha = FakeTHA()
         core.tha_model_fp16 = False
@@ -125,7 +124,6 @@ class CoreTRTCacheHitTests(unittest.TestCase):
         module = load_core_trt_module()
         core = object.__new__(module.CoreTRT)
         core.cacher = None
-        core.cache_stream = FakeStream()
         core.main_stream = FakeStream()
         core.tha = FakeTHA()
         core.tha_model_fp16 = False
