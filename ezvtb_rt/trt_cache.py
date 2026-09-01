@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import tempfile
 import time
-from typing import Iterator, Optional, Union
+from typing import Iterator, List, Optional, Tuple, Union
 
 
 PathLike = Union[str, os.PathLike]
@@ -54,14 +54,113 @@ def file_sha256(path: PathLike) -> str:
     )
 
 
-def get_cache_dir(cache_dir: Optional[PathLike] = None) -> Path:
+class CacheInUseError(RuntimeError):
+    """Raised when a TensorRT engine build lock makes cleanup unsafe."""
+
+
+def resolve_cache_dir(cache_dir: Optional[PathLike] = None) -> Path:
+    """Return the configured cache directory without creating it."""
     if cache_dir is None:
         cache_dir = os.environ.get(ENGINE_CACHE_ENV)
     if cache_dir is None:
         cache_dir = Path(tempfile.gettempdir()) / "ezvtuber_rt_engines"
-    result = Path(cache_dir)
+    return Path(cache_dir)
+
+
+def get_cache_dir(cache_dir: Optional[PathLike] = None) -> Path:
+    result = resolve_cache_dir(cache_dir)
     result.mkdir(parents=True, exist_ok=True)
     return result
+
+
+def _is_managed_cache_file(path: Path) -> bool:
+    """Return whether ``path`` is a file created by this cache module."""
+    if not path.is_file():
+        return False
+    name = path.name
+    if name.endswith(".trt") or name.endswith(".runtime.cache"):
+        return True
+    return (
+        name.startswith(".")
+        and name.endswith(".tmp")
+        and (".trt." in name or ".runtime.cache." in name)
+    )
+
+
+def list_cache_files(cache_dir: Optional[PathLike] = None) -> List[Path]:
+    """List managed cache files in the cache directory, without recursion."""
+    directory = resolve_cache_dir(cache_dir)
+    try:
+        return sorted(
+            (path for path in directory.iterdir() if _is_managed_cache_file(path)),
+            key=lambda path: path.name,
+        )
+    except FileNotFoundError:
+        return []
+
+
+def list_cache_locks(cache_dir: Optional[PathLike] = None) -> List[Path]:
+    """List active TensorRT engine-build lock files without deleting them."""
+    directory = resolve_cache_dir(cache_dir)
+    try:
+        return sorted(
+            (
+                path
+                for path in directory.iterdir()
+                if path.is_file() and path.name.endswith(".trt.lock")
+            ),
+            key=lambda path: path.name,
+        )
+    except FileNotFoundError:
+        return []
+
+
+def get_cache_usage(cache_dir: Optional[PathLike] = None) -> Tuple[int, int]:
+    """Return the number and total bytes of managed persistent cache files."""
+    count = 0
+    total_bytes = 0
+    for path in list_cache_files(cache_dir):
+        try:
+            total_bytes += path.stat().st_size
+            count += 1
+        except FileNotFoundError:
+            pass
+    return count, total_bytes
+
+
+def clear_cache(cache_dir: Optional[PathLike] = None) -> Tuple[int, int]:
+    """Delete only managed persistent cache files and return count/bytes.
+
+    The directory is never recursively removed.  A live engine-build lock makes
+    cleanup fail closed so the launcher cannot delete a cache being written.
+    """
+    directory = resolve_cache_dir(cache_dir)
+    locks = list_cache_locks(directory)
+    if locks:
+        raise CacheInUseError(
+            "TensorRT cache is in use by an engine build: "
+            + ", ".join(path.name for path in locks)
+        )
+
+    deleted_count = 0
+    deleted_bytes = 0
+    for path in list_cache_files(directory):
+        try:
+            size = path.stat().st_size
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        deleted_count += 1
+        deleted_bytes += size
+
+    # Remove the dedicated directory only when it is genuinely empty.  Any
+    # unrelated file (particularly with an overridden path) is preserved.
+    try:
+        directory.rmdir()
+    except (FileNotFoundError, OSError):
+        pass
+
+    return deleted_count, deleted_bytes
 
 
 def _cache_token(*parts: str) -> str:

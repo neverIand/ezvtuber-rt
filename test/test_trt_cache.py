@@ -108,6 +108,57 @@ class TensorRTCacheTests(unittest.TestCase):
                 self.assertTrue(lock_path.is_file())
             self.assertFalse(lock_path.exists())
 
+    def test_cache_cleanup_deletes_only_managed_files(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache_dir = Path(temporary_directory) / "cache"
+            cache_dir.mkdir()
+            engine = cache_dir / "model-abc.trt"
+            runtime = cache_dir / "model-def.runtime.cache"
+            temporary = cache_dir / ".model-abc.trt.random.tmp"
+            unrelated = cache_dir / "keep-me.txt"
+            nested = cache_dir / "nested"
+            nested.mkdir()
+            nested_engine = nested / "keep-me.trt"
+
+            engine.write_bytes(b"engine")
+            runtime.write_bytes(b"runtime")
+            temporary.write_bytes(b"temporary")
+            unrelated.write_bytes(b"unrelated")
+            nested_engine.write_bytes(b"nested")
+
+            self.assertEqual(trt_cache.get_cache_usage(cache_dir), (3, 22))
+            deleted_count, deleted_bytes = trt_cache.clear_cache(cache_dir)
+
+            self.assertEqual((deleted_count, deleted_bytes), (3, 22))
+            self.assertFalse(engine.exists())
+            self.assertFalse(runtime.exists())
+            self.assertFalse(temporary.exists())
+            self.assertEqual(unrelated.read_bytes(), b"unrelated")
+            self.assertEqual(nested_engine.read_bytes(), b"nested")
+            self.assertTrue(cache_dir.is_dir())
+
+    def test_cache_cleanup_refuses_engine_build_lock(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache_dir = Path(temporary_directory)
+            engine = cache_dir / "model.trt"
+            lock = cache_dir / "model.trt.lock"
+            engine.write_bytes(b"engine")
+            lock.write_text("pid=123", encoding="utf-8")
+
+            with self.assertRaises(trt_cache.CacheInUseError):
+                trt_cache.clear_cache(cache_dir)
+
+            self.assertTrue(engine.exists())
+            self.assertTrue(lock.exists())
+
+    def test_empty_cache_inspection_does_not_create_directory(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache_dir = Path(temporary_directory) / "missing"
+
+            self.assertEqual(trt_cache.get_cache_usage(cache_dir), (0, 0))
+            self.assertEqual(trt_cache.list_cache_locks(cache_dir), [])
+            self.assertFalse(cache_dir.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
