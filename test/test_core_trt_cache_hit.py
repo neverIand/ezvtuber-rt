@@ -21,8 +21,8 @@ class FakeStream:
 
 
 class FakeOutputMemory:
-    def __init__(self):
-        self.host = np.zeros((512, 512, 4), dtype=np.uint8)
+    def __init__(self, shape=(512, 512, 4)):
+        self.host = np.zeros(shape, dtype=np.uint8)
         self.htod_calls = 0
         self.dtoh_calls = 0
 
@@ -148,7 +148,7 @@ class CoreTRTCacheHitTests(unittest.TestCase):
         np.testing.assert_array_equal(result[0], cached)
         self.assertEqual(core.tha.infer_calls, 0)
         self.assertEqual(core.tha.output_memory.htod_calls, 0)
-        self.assertEqual(core.tha.cachestream.sync_calls, 1)
+        self.assertEqual(core.tha.cachestream.sync_calls, 0)
 
     def test_copy_output_false_exposes_reusable_host_buffer(self):
         module = load_core_trt_module()
@@ -169,6 +169,7 @@ class CoreTRTCacheHitTests(unittest.TestCase):
 
         self.assertTrue(np.shares_memory(result[0], core.tha.output_memory.host))
         self.assertEqual(core.tha.output_memory.dtoh_calls, 1)
+        self.assertEqual(core.tha.cachestream.sync_calls, 1)
 
     def test_rife_cache_records_every_intermediate_pose_for_all_scales(self):
         module = load_core_trt_module()
@@ -196,6 +197,41 @@ class CoreTRTCacheHitTests(unittest.TestCase):
                         (poses[index].dtype.str, poses[index].shape, poses[index].tobytes()),
                     )
                     np.testing.assert_array_equal(cached_frame, frames[index])
+
+    def test_fully_cached_rife_without_sr_stays_on_host(self):
+        module = load_core_trt_module()
+        cached = np.full((512, 512, 4), 23, dtype=np.uint8)
+        for scale in (2, 3, 4):
+            with self.subTest(scale=scale):
+                rife_output = FakeOutputMemory(
+                    (scale, 512, 512, 4)
+                )
+                core = object.__new__(module.CoreTRT)
+                core.cacher = FakeCacher(cached)
+                core.main_stream = FakeStream()
+                core.tha = FakeTHA()
+                core.tha_model_fp16 = False
+                core.v3 = True
+                core.rife = types.SimpleNamespace(outputs=[rife_output])
+                core.rife_model_scale = scale
+                core.smaller_rifes = []
+                core.sr = None
+                core.sr_a4k = None
+                core.last_tha_output = np.zeros_like(cached)
+                poses = [
+                    np.full(45, index, dtype=np.float32)
+                    for index in range(scale)
+                ]
+
+                result = core.inference(poses)
+
+                expected = np.stack([cached] * scale)
+                np.testing.assert_array_equal(result, expected)
+                self.assertEqual(core.tha.infer_calls, 0)
+                self.assertEqual(core.tha.output_memory.htod_calls, 0)
+                self.assertEqual(rife_output.htod_calls, 0)
+                self.assertEqual(core.main_stream.sync_calls, 0)
+                self.assertEqual(core.tha.cachestream.sync_calls, 0)
 
 
 if __name__ == "__main__":

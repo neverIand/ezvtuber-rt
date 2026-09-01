@@ -239,13 +239,17 @@ class CoreTRT:
             poses: List[np.ndarray],
             copy_output: bool = True,
     ) -> np.ndarray:
+        self._tha_gpu_work_submitted = False
         try:
             return self._inference(poses, copy_output=copy_output)
         finally:
             # VRAM cache copies run on a separate stream. In safety-limited
             # mode, wait here so the caller's duty-cycle timer includes that
             # work instead of letting it consume the scheduled cooldown.
-            if get_gpu_duty_limit_percent() < 100:
+            if (
+                    self._tha_gpu_work_submitted
+                    and get_gpu_duty_limit_percent() < 100
+            ):
                 cache_stream = getattr(self.tha, 'cachestream', None)
                 if cache_stream is not None:
                     cache_stream.synchronize()
@@ -278,6 +282,7 @@ class CoreTRT:
         tha_mem_res: HostDeviceMem = self.tha.getOutputMem()
 
         cached_output = None
+        cached_rife = None
         tha_pose_key = None
         # THA cache lookup for the last pose only (matches ORT semantics)
         if self.cacher is not None:
@@ -288,9 +293,19 @@ class CoreTRT:
                     output = np.copy(cached_output) if copy_output else cached_output
                     return np.expand_dims(output, axis=0)
                 np.copyto(tha_mem_res.host, cached_output)
-                tha_mem_res.htod(self.main_stream)
+                if self.rife is not None and len(poses) > 1:
+                    cached_rife = [
+                        self.cacher.get(array_cache_key(p))
+                        for p in poses[:-1]
+                    ]
+                # A fully cached RIFE batch is assembled entirely on the host;
+                # the current THA device buffer is never consumed in that path.
+                if cached_rife is None or not all(
+                        frame is not None for frame in cached_rife):
+                    tha_mem_res.htod(self.main_stream)
         # Run THA when not cached
         if cached_output is None:
+            self._tha_gpu_work_submitted = True
             self.tha.asyncInfer(tha_pose, self.main_stream)
             # Need host data for caching or SR-only path
             tha_mem_res.dtoh(self.main_stream)
@@ -317,10 +332,14 @@ class CoreTRT:
                 self.rife.outputs[0].dtoh(self.main_stream)
                 self.main_stream.synchronize()
             else:
-                if self.cacher is not None:
-                    cached_rife = [self.cacher.get(array_cache_key(p)) for p in poses[:-1]]
-                else:
-                    cached_rife = [None] * (len(poses) -1)
+                if cached_rife is None:
+                    if self.cacher is not None:
+                        cached_rife = [
+                            self.cacher.get(array_cache_key(p))
+                            for p in poses[:-1]
+                        ]
+                    else:
+                        cached_rife = [None] * (len(poses) - 1)
                 if all(x is None for x in cached_rife): # No cached frames
                     # Prepare previous frame
                     np.copyto(self.rife.inputs[0].host, np.expand_dims(self.last_tha_output, axis=0))
@@ -334,8 +353,8 @@ class CoreTRT:
                     # print('RIFE all frames cached')
                     rife_result = np.stack(cached_rife + [tha_mem_res.host], axis=0)
                     np.copyto(rife_mem_res.host, rife_result)
-                    rife_mem_res.htod(self.main_stream)
-                    self.main_stream.synchronize()
+                    if self.sr is not None:
+                        rife_mem_res.htod(self.main_stream)
                 elif self.rife_model_scale == 3:
                     # rife x3 one frame missing
                     # print('RIFE x3 one frame cache miss')
@@ -360,8 +379,8 @@ class CoreTRT:
                         cached_rife[1] = rife_2x.outputs[0].host[0]
                     rife_result = np.stack(cached_rife + [tha_mem_res.host], axis=0)
                     np.copyto(rife_mem_res.host, rife_result)
-                    rife_mem_res.htod(self.main_stream)
-                    self.main_stream.synchronize()
+                    if self.sr is not None:
+                        rife_mem_res.htod(self.main_stream)
                 elif self.rife_model_scale == 4:
                     # One or two frames missing with rife x4
                     rife_x2 = self.smaller_rifes[0]
@@ -426,8 +445,8 @@ class CoreTRT:
                         raise ValueError('RIFE x4 more than two missing frames not supported')
                     rife_result = np.stack(cached_rife[1:], axis=0)
                     np.copyto(rife_mem_res.host, rife_result)
-                    rife_mem_res.htod(self.main_stream)
-                    self.main_stream.synchronize()
+                    if self.sr is not None:
+                        rife_mem_res.htod(self.main_stream)
                 _cache_rife_intermediate_frames(
                     self.cacher,
                     poses,
