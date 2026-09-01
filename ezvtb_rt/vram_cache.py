@@ -1,4 +1,3 @@
-from ezvtb_rt.trt_utils import *
 import pycuda.driver as cuda
 from collections import OrderedDict
 from typing import Hashable, List, Optional
@@ -64,16 +63,20 @@ class VRAMCacher:
         if key in self._cache:
             self._cache.move_to_end(key)
             return  # Already cached
+
+        # Enforce the configured limit before allocating.  Allocating first
+        # caused a full cache to transiently exceed its limit by one complete
+        # entry, which can trigger avoidable OOMs on tightly sized GPUs.
+        entry_size = sum(buf.host.nbytes for buf in buffers)
+        if entry_size > self.max_size_bytes:
+            return
+        self._evict_until_fit(entry_size)
+
         saved_mems = []
         for buf in buffers:
             saved_mem = VRAMMem(buf.host.nbytes)
             cuda.memcpy_dtod_async(saved_mem.device, buf.device, buf.host.nbytes, self.stream)
             saved_mems.append(saved_mem)
-
-        entry_size = self._calculate_entry_size(saved_mems)
-        
-        # Evict entries if needed to make room
-        self._evict_until_fit(entry_size)
         
         # Add new entry at the end (most recently used)
         self._cache[key] = saved_mems

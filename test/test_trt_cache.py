@@ -93,8 +93,12 @@ class TensorRTCacheTests(unittest.TestCase):
             self.assertIs(runtime_config.attached, runtime_cache)
             self.assertEqual(runtime_cache.deserialized, b"existing-cache")
 
-            trt_cache.save_runtime_cache(runtime_cache, cache_path)
+            self.assertTrue(trt_cache.save_runtime_cache(runtime_cache, cache_path))
             self.assertEqual(cache_path.read_bytes(), b"new-cache")
+
+            written_at = cache_path.stat().st_mtime_ns
+            self.assertFalse(trt_cache.save_runtime_cache(runtime_cache, cache_path))
+            self.assertEqual(cache_path.stat().st_mtime_ns, written_at)
 
     def test_engine_build_lock_removes_lock_file(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

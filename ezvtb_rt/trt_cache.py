@@ -181,13 +181,23 @@ def load_runtime_cache(runtime_config, path: PathLike):
     return runtime_cache, loaded
 
 
-def save_runtime_cache(runtime_cache, path: PathLike) -> None:
-    """Serialize a TensorRT-RTX runtime cache using an atomic replacement."""
+def save_runtime_cache(runtime_cache, path: PathLike) -> bool:
+    """Serialize a runtime cache, replacing the file only when it changed."""
     serialized = runtime_cache.serialize()
     if serialized is None:
         raise RuntimeError("TensorRT-RTX returned an empty runtime cache")
     if hasattr(serialized, "__enter__"):
         with serialized as buffer:
-            atomic_write(path, buffer)
+            data = bytes(buffer)
     else:
-        atomic_write(path, serialized)
+        data = bytes(serialized)
+
+    cache_path = Path(path)
+    try:
+        if cache_path.stat().st_size == len(data) and cache_path.read_bytes() == data:
+            return False
+    except FileNotFoundError:
+        pass
+
+    atomic_write(cache_path, data)
+    return True
