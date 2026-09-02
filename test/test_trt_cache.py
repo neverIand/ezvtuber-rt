@@ -102,6 +102,26 @@ class TensorRTCacheTests(unittest.TestCase):
             self.assertFalse(trt_cache.save_runtime_cache(runtime_cache, cache_path))
             self.assertEqual(cache_path.stat().st_mtime_ns, written_at)
 
+    def test_runtime_schema_change_does_not_invalidate_engine_cache(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "model.onnx"
+            source.write_bytes(b"model")
+            cache_dir = root / "cache"
+
+            engine_before = trt_cache.get_engine_cache_path(
+                source, "1.3", cache_dir)
+            runtime_before = trt_cache.get_runtime_cache_path(
+                source, "1.3", cache_dir)
+            with mock.patch.object(trt_cache, "RUNTIME_CACHE_SCHEMA", "next"):
+                engine_after = trt_cache.get_engine_cache_path(
+                    source, "1.3", cache_dir)
+                runtime_after = trt_cache.get_runtime_cache_path(
+                    source, "1.3", cache_dir)
+
+            self.assertEqual(engine_after, engine_before)
+            self.assertNotEqual(runtime_after, runtime_before)
+
     def test_engine_build_lock_removes_lock_file(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             engine_path = Path(temporary_directory) / "model.trt"

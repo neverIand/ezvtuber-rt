@@ -50,9 +50,10 @@ class FakeEngine:
 
 class FakeStream:
     handle = 123
+    synchronize_calls = 0
 
     def synchronize(self):
-        pass
+        type(self).synchronize_calls += 1
 
 
 class FakeEvent:
@@ -72,6 +73,7 @@ class FakeEvent:
 def load_trt_engine_module(save_calls):
     FakeEvent.created = 0
     FakeEvent.record_calls = 0
+    FakeStream.synchronize_calls = 0
     fake_package = types.ModuleType("ezvtb_rt")
     fake_package.__path__ = [str(PACKAGE_DIR)]
 
@@ -100,7 +102,9 @@ def load_trt_engine_module(save_calls):
     fake_utils.load_engine = lambda path: fake_engine
     fake_utils.get_runtime_cache_path = lambda path: Path(f"{path}.runtime.cache")
     fake_utils.load_runtime_cache = lambda config, path: (fake_runtime_cache, True)
-    fake_utils.save_runtime_cache = lambda cache, path: save_calls.append((cache, path))
+    fake_utils.save_runtime_cache = lambda cache, path: save_calls.append(
+        (cache, path, FakeStream.synchronize_calls)
+    )
     fake_utils.pace_gpu_startup = lambda started, operation: 0.0
 
     replacements = {
@@ -123,13 +127,16 @@ def load_trt_engine_module(save_calls):
 
 
 class TensorRTEngineTests(unittest.TestCase):
-    def test_runtime_cache_is_kept_and_saved_after_first_enqueue(self):
+    def test_runtime_cache_is_saved_only_after_first_enqueue_completes(self):
         save_calls = []
         module, fake_engine, fake_runtime_cache = load_trt_engine_module(save_calls)
 
         with mock.patch.dict(
                 'os.environ',
-                {module.PROFILE_INFERENCE_ENV: ''},
+                {
+                    module.PROFILE_INFERENCE_ENV: '',
+                    module.RUNTIME_CACHE_ENV: '1',
+                },
         ):
             engine = module.TRTEngine("model.onnx", n_input=0)
         self.assertIs(engine.runtime_config, fake_engine.runtime_config)
@@ -138,16 +145,19 @@ class TensorRTEngineTests(unittest.TestCase):
         self.assertIsNone(engine.start_event)
         self.assertIsNone(engine.end_event)
         self.assertEqual(FakeEvent.created, 0)
-        self.assertEqual(len(save_calls), 1)
+        self.assertEqual(len(save_calls), 0)
 
         engine.kickoff()
         self.assertEqual(fake_engine.context.execute_calls, 1)
         self.assertEqual(FakeEvent.record_calls, 0)
-        self.assertEqual(len(save_calls), 2)
+        self.assertEqual(len(save_calls), 1)
+        self.assertEqual(FakeStream.synchronize_calls, 1)
+        self.assertEqual(save_calls[-1][2], 1)
 
         engine.kickoff()
         self.assertEqual(fake_engine.context.execute_calls, 2)
-        self.assertEqual(len(save_calls), 2)
+        self.assertEqual(len(save_calls), 1)
+        self.assertEqual(FakeStream.synchronize_calls, 1)
 
         with self.assertRaisesRegex(RuntimeError, 'profiling is disabled'):
             engine.get_last_inference_time()
@@ -156,11 +166,15 @@ class TensorRTEngineTests(unittest.TestCase):
         save_calls = []
         module, fake_engine, _ = load_trt_engine_module(save_calls)
 
-        engine = module.TRTEngine(
-            "model.onnx",
-            n_input=0,
-            profile_inference=True,
-        )
+        with mock.patch.dict(
+                'os.environ',
+                {module.RUNTIME_CACHE_ENV: '1'},
+        ):
+            engine = module.TRTEngine(
+                "model.onnx",
+                n_input=0,
+                profile_inference=True,
+            )
         self.assertEqual(FakeEvent.created, 2)
 
         engine.kickoff()
@@ -175,12 +189,34 @@ class TensorRTEngineTests(unittest.TestCase):
 
         with mock.patch.dict(
                 'os.environ',
-                {module.PROFILE_INFERENCE_ENV: 'yes'},
+                {
+                    module.PROFILE_INFERENCE_ENV: 'yes',
+                    module.RUNTIME_CACHE_ENV: '1',
+                },
         ):
             engine = module.TRTEngine("model.onnx", n_input=0)
 
         self.assertTrue(engine.profile_inference)
         self.assertEqual(FakeEvent.created, 2)
+
+    def test_runtime_cache_is_disabled_by_default(self):
+        save_calls = []
+        module, fake_engine, _ = load_trt_engine_module(save_calls)
+
+        with mock.patch.dict(
+                'os.environ',
+                {
+                    module.PROFILE_INFERENCE_ENV: '',
+                    module.RUNTIME_CACHE_ENV: '',
+                },
+        ):
+            engine = module.TRTEngine("model.onnx", n_input=0)
+
+        self.assertIsNone(engine.runtime_cache)
+        engine.kickoff()
+        self.assertEqual(fake_engine.context.execute_calls, 1)
+        self.assertEqual(FakeStream.synchronize_calls, 0)
+        self.assertEqual(save_calls, [])
 
 
 if __name__ == "__main__":

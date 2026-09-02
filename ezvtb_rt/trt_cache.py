@@ -18,7 +18,10 @@ from typing import Iterator, List, Optional, Tuple, Union
 
 PathLike = Union[str, os.PathLike]
 ENGINE_CACHE_SCHEMA = "2"
-RUNTIME_CACHE_SCHEMA = "1"
+# Schema 1 could be serialized immediately after an asynchronous enqueue,
+# before the GPU had completed JIT/inference work. Do not reuse those blobs;
+# engine caches have a separate schema and remain valid.
+RUNTIME_CACHE_SCHEMA = "2"
 ENGINE_CACHE_ENV = "EZVTB_TRT_CACHE_DIR"
 DEFAULT_CACHE_APP_DIR = "EasyVtuber"
 DEFAULT_CACHE_DIR_NAME = "trt-cache"

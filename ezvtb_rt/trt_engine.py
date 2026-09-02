@@ -14,10 +14,21 @@ import time
 
 
 PROFILE_INFERENCE_ENV = 'EZVTB_TRT_PROFILE'
+RUNTIME_CACHE_ENV = 'EZVTB_TRT_RUNTIME_CACHE'
 
 
 def _profile_inference_enabled() -> bool:
     return os.environ.get(PROFILE_INFERENCE_ENV, '').strip().lower() in (
+        '1',
+        'true',
+        'yes',
+        'on',
+    )
+
+
+def _runtime_cache_enabled() -> bool:
+    """Opt in while TensorRT-RTX 1.3 runtime-cache I/O is unstable."""
+    return os.environ.get(RUNTIME_CACHE_ENV, '').strip().lower() in (
         '1',
         'true',
         'yes',
@@ -73,7 +84,7 @@ class TRTEngine:
         self.runtime_config.cuda_graph_strategy = trt.CudaGraphStrategy.WHOLE_GRAPH_CAPTURE
         self.runtime_cache = None
         self.runtime_cache_path = None
-        if source_path is not None:
+        if source_path is not None and _runtime_cache_enabled():
             try:
                 self.runtime_cache_path = get_runtime_cache_path(source_path)
                 self.runtime_cache, cache_loaded = load_runtime_cache(
@@ -107,10 +118,9 @@ class TRTEngine:
             raise RuntimeError('TensorRT failed to create an inference context')
 
         # Keep the runtime config/cache alive for the lifetime of the context.
-        # Context creation may already JIT kernels, while the first inference can
-        # add shape-specific kernels, so persist at both points.
-        self._runtime_cache_save_pending = self.runtime_cache is not None
-        self._persist_runtime_cache()
+        # Dynamic input shapes are not configured yet, so serializing here can
+        # block in the native runtime or save an incomplete cache. Persist only
+        # after the first shape-specific inference has completed.
         self._runtime_cache_save_pending = self.runtime_cache is not None
         self.n_batch: int = -1
         self.in_out_tensors: dict = {}
@@ -201,12 +211,19 @@ class TRTEngine:
         self.context.execute_async_v3(stream.handle)
         if self.end_event is not None:
             self.end_event.record(stream)
-        if self._runtime_cache_save_pending:
+
+        # Runtime-cache data may be populated by the first shape-specific
+        # enqueue. NVIDIA's documented flow saves it only after inference has
+        # completed. Serializing here before the asynchronous stream finished
+        # could produce a blob that deserialized successfully but stalled the
+        # next process during execution-context creation. Pay one synchronization
+        # per newly configured batch shape, then persist a complete cache.
+        cache_save_pending = self._runtime_cache_save_pending
+        if sync or cache_save_pending:
+            stream.synchronize()
+        if cache_save_pending:
             self._persist_runtime_cache()
             self._runtime_cache_save_pending = False
-        # Synchronize the stream if requested
-        if sync:
-            stream.synchronize()
 
     def asyncKickoff(self, stream: cuda.Stream = None):
         self.kickoff(stream, sync=False)
