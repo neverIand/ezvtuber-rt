@@ -13,7 +13,7 @@ class LazyImportTests(unittest.TestCase):
             "import sys; "
             f"sys.path.insert(0, {str(PROJECT_ROOT)!r}); "
             "import ezvtb_rt; "
-            "forbidden = ('tensorrt_rtx', 'pycuda.autoinit', 'onnxruntime'); "
+            "forbidden = ('tensorrt_rtx', 'pycuda.autoinit', 'pycuda.driver', 'ezvtb_rt.cuda_primary', 'onnxruntime'); "
             "assert not any(name in sys.modules for name in forbidden)"
         )
         result = subprocess.run(

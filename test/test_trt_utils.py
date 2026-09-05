@@ -96,6 +96,24 @@ def loaded_trt_utils():
 
 
 class TensorRTUtilsTests(unittest.TestCase):
+    def test_required_cache_never_builds_missing_or_invalid_engine(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / 'model.onnx'
+            source.write_bytes(b'onnx-model')
+            with mock.patch.dict('os.environ', {
+                    'EZVTB_TRT_CACHE_DIR': str(root / 'cache'),
+                    'EZVTB_TRT_REQUIRE_ENGINE_CACHE': '1',
+            }), loaded_trt_utils() as trt_utils:
+                trt_utils.build_engine = mock.Mock()
+                with self.assertRaisesRegex(trt_utils.EngineCacheRequiredError, 'existing valid TensorRT engine'):
+                    trt_utils.load_engine(str(source))
+                cached = trt_utils.get_engine_cache_path(str(source))
+                cached.write_bytes(b'BAD!invalid engine')
+                with self.assertRaisesRegex(trt_utils.EngineCacheRequiredError, 'existing valid TensorRT engine'):
+                    trt_utils.load_engine(str(source))
+                trt_utils.build_engine.assert_not_called()
+
     def test_cache_identity_does_not_require_an_active_context(self):
         with loaded_trt_utils() as trt_utils, mock.patch.dict(
             os.environ,

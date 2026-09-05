@@ -40,7 +40,9 @@ def __getattr__(name: str):
 
         device_id = int(os.environ.get("EZVTB_DEVICE_ID", "0"))
         cudaSetDevice(device_id)
-        import pycuda.autoinit  # Ensure PyCUDA is initialized after selecting the device.
+        # TensorRT-RTX uses the primary context. A separate user context from
+        # pycuda.autoinit can conflict with its CUDA runtime / JIT work.
+        import ezvtb_rt.cuda_primary
         from ezvtb_rt.core_trt import CoreTRT
 
         globals()[name] = CoreTRT

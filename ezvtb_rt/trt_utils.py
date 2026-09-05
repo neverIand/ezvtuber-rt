@@ -8,6 +8,7 @@ import pycuda.driver as cuda
 from os.path import join
 import numpy
 from ezvtb_rt.trt_cache import (
+    EngineCacheRequiredError,
     atomic_write,
     engine_build_lock,
     get_engine_cache_path as _get_engine_cache_path,
@@ -18,6 +19,7 @@ from ezvtb_rt.trt_cache import (
 
 TRT_LOGGER = trt.Logger(trt.Logger.INFO)
 GPU_DUTY_LIMIT_ENV = "EZVTB_GPU_DUTY_LIMIT"
+REQUIRE_ENGINE_CACHE_ENV = "EZVTB_TRT_REQUIRE_ENGINE_CACHE"
 
 # Solution from https://github.com/NVIDIA/TensorRT/issues/1050#issuecomment-775019583
 def cudaSetDevice(device_idx):
@@ -200,6 +202,12 @@ def load_engine(path):
         engine = _deserialize_engine(engine_path)
         if engine is not None:
             return engine
+
+    if os.environ.get(REQUIRE_ENGINE_CACHE_ENV, '').strip().lower() in ('1', 'true', 'yes', 'on'):
+        raise EngineCacheRequiredError(
+            f'An existing valid TensorRT engine is required: {engine_path}. '
+            'Engine building is disabled during guarded runtime-cache startup/recovery.'
+        )
 
     # Recheck after taking the lock: another EasyVtuber process may have built it.
     with engine_build_lock(engine_path):

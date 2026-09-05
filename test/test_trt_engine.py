@@ -127,6 +127,17 @@ def load_trt_engine_module(save_calls):
 
 
 class TensorRTEngineTests(unittest.TestCase):
+    def test_failed_enqueue_does_not_synchronize_or_serialize_cache(self):
+        save_calls = []
+        module, fake_engine, _ = load_trt_engine_module(save_calls)
+        with mock.patch.dict('os.environ', {module.RUNTIME_CACHE_ENV: '1'}):
+            engine = module.TRTEngine('model.onnx', n_input=0)
+        fake_engine.context.execute_async_v3 = lambda handle: False
+        with self.assertRaisesRegex(RuntimeError, 'enqueue failed'):
+            engine.kickoff()
+        self.assertEqual(FakeStream.synchronize_calls, 0)
+        self.assertEqual(save_calls, [])
+
     def test_runtime_cache_is_saved_only_after_first_enqueue_completes(self):
         save_calls = []
         module, fake_engine, fake_runtime_cache = load_trt_engine_module(save_calls)

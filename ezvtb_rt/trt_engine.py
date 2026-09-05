@@ -78,7 +78,8 @@ class TRTEngine:
             engine = load_engine(source_path)
             assert engine is not None, f'Failed to load engine from path {engine}'
         self.engine: trt.ICudaEngine = engine
-        TRT_LOGGER.log(TRT_LOGGER.INFO, 'Creating inference context')
+        source_name = Path(source_path).name if source_path else 'in-memory engine'
+        TRT_LOGGER.log(TRT_LOGGER.INFO, f'Creating inference context: {source_name}')
         # create execution context
         self.runtime_config = engine.create_runtime_config()
         self.runtime_config.cuda_graph_strategy = trt.CudaGraphStrategy.WHOLE_GRAPH_CAPTURE
@@ -118,9 +119,9 @@ class TRTEngine:
             raise RuntimeError('TensorRT failed to create an inference context')
 
         # Keep the runtime config/cache alive for the lifetime of the context.
-        # Dynamic input shapes are not configured yet, so serializing here can
-        # block in the native runtime or save an incomplete cache. Persist only
-        # after the first shape-specific inference has completed.
+        # Persist after successful inference and stream completion, including
+        # for static models. Dynamic background specialization may require
+        # additional handling; stream completion alone does not wait for it.
         self._runtime_cache_save_pending = self.runtime_cache is not None
         self.n_batch: int = -1
         self.in_out_tensors: dict = {}
@@ -208,7 +209,8 @@ class TRTEngine:
         if self.start_event is not None:
             self.start_event.record(stream)
         # Run inference.
-        self.context.execute_async_v3(stream.handle)
+        if not self.context.execute_async_v3(stream.handle):
+            raise RuntimeError('TensorRT inference enqueue failed; runtime cache was not saved')
         if self.end_event is not None:
             self.end_event.record(stream)
 

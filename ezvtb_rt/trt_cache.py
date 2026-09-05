@@ -17,6 +17,12 @@ from typing import Iterator, List, Optional, Tuple, Union
 
 
 PathLike = Union[str, os.PathLike]
+
+
+class EngineCacheRequiredError(RuntimeError):
+    """A cache-only startup needs an engine build before it can proceed."""
+
+
 ENGINE_CACHE_SCHEMA = "2"
 # Schema 1 could be serialized immediately after an asynchronous enqueue,
 # before the GPU had completed JIT/inference work. Do not reuse those blobs;
